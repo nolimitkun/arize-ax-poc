@@ -4,4 +4,3 @@ __pycache__/
 *.pyc
 .out/
 *.parquet
-uv.lock
