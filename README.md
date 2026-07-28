@@ -68,6 +68,15 @@ dataframes match the Arize SDK's column contracts — so a later failure means
 You need an Arize space (`ARIZE_API_KEY`, `ARIZE_SPACE_ID`, `ARIZE_SPACE_NAME`)
 and a `DEEPSEEK_API_KEY`. One optional extra is called out at step 05.
 
+**If your space is not in the US, set `ARIZE_REGION`** (e.g. `eu-west-1a`).
+Arize keys are region-scoped and a cross-region key fails to authorize rather
+than redirecting — on the trace exporter that surfaces as the fairly opaque
+`unable to validate authorization from span`. Region has to reach two places:
+the OTel collector URL and the platform client. `ARIZE_REGION` drives both, so
+prefer it over setting an endpoint by hand; `ARIZE_COLLECTOR_ENDPOINT` (or
+`ARIZE_OTLP_ENDPOINT`) still wins if you need to pin one explicitly. Each
+script prints the region it resolved in its banner.
+
 ---
 
 ## The tour

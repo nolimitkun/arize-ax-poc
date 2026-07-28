@@ -31,6 +31,8 @@ class Settings:
     arize_space_id: str
     arize_space_name: str
     arize_project_name: str
+    arize_region: str | None
+    arize_otlp_endpoint: str
     deepseek_api_key: str
     deepseek_base_url: str
     arize_ai_integration_id: str | None
@@ -54,6 +56,41 @@ _REQUIRED = {
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 
 
+# --------------------------------------------------------------------------
+# Region
+#
+# Arize keys are region-scoped, and a key from one region hitting another
+# returns an authorization failure, not a redirect -- on the trace exporter it
+# surfaces as "unable to validate authorization from span".
+#
+# Region has to reach *two* independent places, which is the trap: the OTel
+# exporter takes a collector URL (env ARIZE_COLLECTOR_ENDPOINT), while the
+# platform client takes a region enum (env ARIZE_REGION). Setting only the
+# first fixes tracing and leaves every export/dataset/experiment call pointed
+# at the default region. So ARIZE_REGION is the single knob here, and the
+# endpoint is derived from it.
+# --------------------------------------------------------------------------
+
+DEFAULT_OTLP_ENDPOINT = "https://otlp.arize.com/v1"
+
+_REGION_OTLP_ENDPOINTS = {
+    "eu-west-1a": "https://otlp.eu-west-1a.arize.com/v1",
+    "ca-central-1a": "https://otlp.ca-central-1a.arize.com/v1",
+}
+
+
+def _resolve_otlp_endpoint(region: str | None) -> str:
+    """Collector URL for a region, with an explicit override winning.
+
+    Both env names are honoured: ARIZE_COLLECTOR_ENDPOINT is what the Arize SDK
+    itself reads, and ARIZE_OTLP_ENDPOINT is the name people reach for first.
+    """
+    explicit = os.getenv("ARIZE_COLLECTOR_ENDPOINT") or os.getenv("ARIZE_OTLP_ENDPOINT")
+    if explicit:
+        return explicit
+    return _REGION_OTLP_ENDPOINTS.get(region or "", DEFAULT_OTLP_ENDPOINT)
+
+
 def load_settings() -> Settings:
     missing = [f"  {name:<22} ({where})" for name, where in _REQUIRED.items() if not os.getenv(name)]
     if missing:
@@ -62,11 +99,14 @@ def load_settings() -> Settings:
             + "\n".join(missing)
             + "\n\nCopy .env.example to .env and fill these in."
         )
+    region = os.getenv("ARIZE_REGION") or None
     return Settings(
         arize_api_key=os.environ["ARIZE_API_KEY"],
         arize_space_id=os.environ["ARIZE_SPACE_ID"],
         arize_space_name=os.environ["ARIZE_SPACE_NAME"],
         arize_project_name=os.getenv("ARIZE_PROJECT_NAME", "nimbus-support-copilot"),
+        arize_region=region,
+        arize_otlp_endpoint=_resolve_otlp_endpoint(region),
         deepseek_api_key=os.environ["DEEPSEEK_API_KEY"],
         deepseek_base_url=os.getenv("DEEPSEEK_BASE_URL", DEEPSEEK_BASE_URL),
         arize_ai_integration_id=os.getenv("ARIZE_AI_INTEGRATION_ID") or None,

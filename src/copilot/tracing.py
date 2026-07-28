@@ -38,10 +38,13 @@ def init_tracing(settings: Settings, project_name: str | None = None) -> trace_a
     from arize.otel import register
     from openinference.instrumentation.openai import OpenAIInstrumentor
 
+    # endpoint is passed explicitly rather than left to register()'s default,
+    # so the region resolved in config.py is the one that actually applies.
     tracer_provider = register(
         space_id=settings.arize_space_id,
         api_key=settings.arize_api_key,
         project_name=project_name or settings.arize_project_name,
+        endpoint=settings.arize_otlp_endpoint,
     )
     OpenAIInstrumentor().instrument(tracer_provider=tracer_provider, skip_dep_check=True)
 

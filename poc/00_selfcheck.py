@@ -249,11 +249,10 @@ def check_targets_ax_not_phoenix() -> None:
         Endpoint.ARIZE.value == "https://otlp.arize.com/v1",
         Endpoint.ARIZE.value,
     )
-    # register() honours this before its default; a stale value would silently
-    # send the whole tour somewhere other than AX.
-    override = os.getenv("ARIZE_COLLECTOR_ENDPOINT")
+    # A stale value here would silently send the whole tour somewhere else.
+    override = os.getenv("ARIZE_COLLECTOR_ENDPOINT") or os.getenv("ARIZE_OTLP_ENDPOINT")
     check(
-        "no ARIZE_COLLECTOR_ENDPOINT override redirecting traces",
+        "no collector-endpoint override pointing away from Arize",
         not override or "arize.com" in override,
         f"set to {override!r}",
     )
@@ -275,7 +274,49 @@ def check_targets_ax_not_phoenix() -> None:
     check("no Phoenix tracing/server imports", not offenders, str(offenders))
 
     tracing_src = (root / "src" / "copilot" / "tracing.py").read_text(encoding="utf-8")
-    check("tracing bootstrap registers via arize.otel", "from arize.otel import register" in tracing_src)
+    check(
+        "tracing bootstrap registers via arize.otel",
+        "from arize.otel import register" in tracing_src,
+    )
+
+
+def check_region_wiring() -> None:
+    """Region has to reach the exporter *and* the platform client.
+
+    A key from one region is not valid in another, so a half-applied region is
+    the difference between "tracing works but every export 401s" and a working
+    tour. These checks pin the mapping without needing credentials.
+    """
+    console.print("\n[bold]Region wiring[/bold]")
+    import os
+
+    from arize.regions import Region
+
+    from copilot.config import DEFAULT_OTLP_ENDPOINT, _resolve_otlp_endpoint
+
+    configured = os.getenv("ARIZE_REGION") or None
+    check(
+        f"ARIZE_REGION is a value the SDK accepts ({configured or 'unset → US default'})",
+        configured is None or configured in {r.value for r in Region},
+        f"{configured!r} is not one of {sorted(r.value for r in Region)}",
+    )
+
+    # Only assert the mapping when nothing is overriding it, or the override
+    # (legitimately) wins and these would fail for the wrong reason.
+    explicit = os.getenv("ARIZE_COLLECTOR_ENDPOINT") or os.getenv("ARIZE_OTLP_ENDPOINT")
+    if explicit:
+        console.print(f"  [dim]— endpoint pinned explicitly to {explicit}; mapping not asserted[/dim]")
+    else:
+        check(
+            "eu-west-1a resolves to the EU collector",
+            _resolve_otlp_endpoint("eu-west-1a") == "https://otlp.eu-west-1a.arize.com/v1",
+            _resolve_otlp_endpoint("eu-west-1a"),
+        )
+        check(
+            "no region resolves to the US collector",
+            _resolve_otlp_endpoint(None) == DEFAULT_OTLP_ENDPOINT,
+            _resolve_otlp_endpoint(None),
+        )
 
 
 def check_sdk_surface() -> None:
@@ -331,6 +372,7 @@ def main() -> None:
     check_prompts_and_tools()
     check_dataframe_contracts()
     check_targets_ax_not_phoenix()
+    check_region_wiring()
     check_sdk_surface()
 
     console.print()

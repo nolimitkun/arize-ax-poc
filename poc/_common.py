@@ -33,14 +33,25 @@ def header(step: str, title: str, docs: str) -> Settings:
     )
     settings = settings_or_exit()
     console.print(
-        f"[dim]space={settings.arize_space_name}  project={settings.arize_project_name}[/dim]\n"
+        f"[dim]space={settings.arize_space_name}  project={settings.arize_project_name}  "
+        f"region={settings.arize_region or 'default (US)'}[/dim]\n"
     )
     return settings
 
 
 def arize_client(settings: Settings):
+    """The platform client, region-matched to the trace exporter.
+
+    An EU space needs region here as well as a EU collector URL in tracing.py;
+    fixing only the latter leaves every span export and dataset call hitting
+    the default region with a key that isn't valid there.
+    """
     from arize.client import ArizeClient
 
+    if settings.arize_region:
+        from arize.regions import Region
+
+        return ArizeClient(api_key=settings.arize_api_key, region=Region(settings.arize_region))
     return ArizeClient(api_key=settings.arize_api_key)
 
 
