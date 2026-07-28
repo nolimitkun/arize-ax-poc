@@ -1,0 +1,220 @@
+#!/usr/bin/env python
+"""Step 06 -- Evaluate: human review, and whether the judge agrees with it.
+
+An LLM judge is only worth trusting once you've measured it against human
+labels. This step:
+
+  1. defines an annotation config (the label schema reviewers use)
+  2. creates a labelling queue seeded with the failing spans
+  3. writes simulated human labels back via `spans.update_annotations()`
+  4. reports judge-vs-human agreement
+
+Step 3 is simulated so the tour runs unattended; in practice a human works the
+queue in the UI and step 4 is what you actually care about.
+
+Docs: https://arize.com/docs/ax/evaluate/human-review
+      https://arize.com/docs/ax/evaluate/labeling-queues
+      https://arize.com/docs/ax/evaluate/align-evals-to-human-feedback
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+import pandas as pd
+import typer
+
+from _common import arize_client, console, done, header, load, look_at, save, table, window
+
+app = typer.Typer(add_completion=False)
+
+ANNOTATION_NAME = "human_groundedness"
+REVIEWER = "poc-reviewer@example.com"
+
+
+def simulated_human_label(row: pd.Series) -> tuple[str, float, str]:
+    """Stand-in for a human reviewer.
+
+    Uses the fixture's ground truth rather than the judge's output, so
+    agreement is a real measurement and not a tautology. The deliberate ~8%
+    disagreement rate on non-refund turns reflects that human labels are noisy
+    too -- perfect agreement in a POC should make you suspicious, not happy.
+    """
+    expected = str(row.get("expected_behavior", ""))
+    answer = str(row.get("answer", ""))
+    hedged = any(
+        m in answer.lower()
+        for m in ("doesn't cover", "does not cover", "don't want to guess", "not documented")
+    )
+    if expected == "refuse_no_context":
+        if hedged:
+            return "grounded", 1.0, "Correctly declined to state an undocumented policy."
+        return "hallucinated", 0.0, "Stated a refund policy that is not in the documentation."
+
+    # Non-refund turns: mostly grounded, with a little reviewer noise.
+    noisy = (abs(hash(str(row.get("span_id", "")))) % 100) < 8
+    if noisy:
+        return "hallucinated", 0.0, "Reviewer flagged an unsupported detail in the answer."
+    return "grounded", 1.0, "Claims trace back to the retrieved documentation."
+
+
+@app.command()
+def main(
+    sample: int = typer.Option(20, help="How many spans to put in the review queue"),
+    skip_queue: bool = typer.Option(False, help="Skip queue creation, just write labels"),
+) -> None:
+    settings = header(
+        "06",
+        "Evaluate: human review queue, labels, and judge agreement",
+        "human-review · labeling-queues · align-evals-to-human-feedback",
+    )
+
+    from arize.annotation_configs.types import (
+        CategoricalAnnotationValue,
+        OptimizationDirection,
+    )
+
+    client = arize_client(settings)
+    turns = load("03_turns.parquet")
+
+    # Prioritise failing turns -- reviewer time is the scarce resource.
+    ranked = turns.sort_values("is_failure", ascending=False).head(sample).copy()
+    console.print(
+        f"Selected [bold]{len(ranked)}[/bold] spans for review "
+        f"({int(ranked['is_failure'].sum())} already flagged by code checks).\n"
+    )
+
+    # ---- 1. Annotation config -------------------------------------------
+    try:
+        config = client.annotation_configs.create_categorical(
+            name=ANNOTATION_NAME,
+            space=settings.arize_space_name,
+            values=[
+                CategoricalAnnotationValue(label="grounded", score=1),
+                CategoricalAnnotationValue(label="hallucinated", score=0),
+            ],
+            optimization_direction=OptimizationDirection.MAXIMIZE,
+        )
+        console.print(
+            f"[green]Created annotation config[/green] {ANNOTATION_NAME} "
+            f"({getattr(config, 'id', '?')})"
+        )
+        config_id = str(getattr(config, "id", ""))
+    except Exception as exc:  # noqa: BLE001 - re-runs hit "already exists"
+        console.print(f"[yellow]Annotation config not created ({exc}); reusing if present.[/yellow]")
+        existing = client.annotation_configs.list(space=settings.arize_space_name, limit=100)
+        items = getattr(existing, "data", None) or getattr(existing, "annotation_configs", [])
+        match = next((c for c in items if getattr(c, "name", "") == ANNOTATION_NAME), None)
+        config_id = str(getattr(match, "id", "")) if match else ""
+
+    # ---- 2. Labelling queue ---------------------------------------------
+    if not skip_queue and config_id:
+        start, end = window(48)
+        try:
+            project = client.projects.get(
+                project=settings.arize_project_name, space=settings.arize_space_name
+            )
+            queue = client.annotation_queues.create(
+                name="Groundedness review",
+                space=settings.arize_space_name,
+                annotation_config_ids=[config_id],
+                annotator_emails=[REVIEWER],
+                instructions=(
+                    "Read the question and the assistant's answer. Mark 'hallucinated' "
+                    "if the answer states any Nimbus policy, number or timeframe that "
+                    "isn't in the retrieved documentation -- even if it sounds right. "
+                    "Declining to answer an undocumented question is 'grounded'."
+                ),
+                record_sources=[
+                    {
+                        "record_type": "span",
+                        "project_id": str(project.id),
+                        "start_time": start,
+                        "end_time": end,
+                        "span_ids": [str(s) for s in ranked["span_id"].tolist()],
+                    }
+                ],
+            )
+            console.print(
+                f"[green]Created review queue[/green] Groundedness review "
+                f"({getattr(queue, 'id', '?')}) with {len(ranked)} records"
+            )
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[yellow]Queue not created: {exc}[/yellow]")
+
+    # ---- 3. Write human labels ------------------------------------------
+    console.print("\n[bold]Writing (simulated) human labels[/bold]")
+    labels = ranked.apply(simulated_human_label, axis=1, result_type="expand")
+    now = datetime.now(timezone.utc)
+    annotations = pd.DataFrame(
+        {
+            "context.span_id": ranked["span_id"].astype(str).values,
+            f"annotation.{ANNOTATION_NAME}.label": labels[0].values,
+            f"annotation.{ANNOTATION_NAME}.score": labels[1].astype(float).values,
+            f"annotation.{ANNOTATION_NAME}.text": labels[2].values,
+            f"annotation.{ANNOTATION_NAME}.updated_by": REVIEWER,
+            f"annotation.{ANNOTATION_NAME}.updated_at": int(now.timestamp() * 1000),
+        }
+    )
+    client.spans.update_annotations(
+        space_id=settings.arize_space_id,
+        project_name=settings.arize_project_name,
+        dataframe=annotations,
+    )
+    console.print(f"[green]Logged {len(annotations)} human annotations.[/green]")
+    save("06_annotations.parquet", annotations)
+
+    # ---- 4. Judge vs human ----------------------------------------------
+    try:
+        judge = load("04_evals.parquet")
+    except SystemExit:
+        console.print("[yellow]No 04_evals.parquet — skipping agreement.[/yellow]")
+        done()
+        return
+
+    judge_col = "eval.groundedness.label"
+    if judge_col not in judge.columns:
+        console.print(f"[yellow]{judge_col} not present (was 04 run with --skip-llm?).[/yellow]")
+        done()
+        return
+
+    merged = annotations.merge(
+        judge[["context.span_id", judge_col]], on="context.span_id", how="inner"
+    )
+    human_col = f"annotation.{ANNOTATION_NAME}.label"
+    agree = (merged[human_col] == merged[judge_col]).sum()
+    n = len(merged)
+
+    both_bad = ((merged[human_col] == "hallucinated") & (merged[judge_col] == "hallucinated")).sum()
+    judge_only = ((merged[human_col] == "grounded") & (merged[judge_col] == "hallucinated")).sum()
+    human_only = ((merged[human_col] == "hallucinated") & (merged[judge_col] == "grounded")).sum()
+
+    table(
+        "Judge vs human (label = hallucinated)",
+        ["metric", "value"],
+        [
+            ["compared spans", n],
+            ["agreement", f"{100 * agree / n:.0f}%" if n else "n/a"],
+            ["both flagged", both_bad],
+            ["judge flagged, human didn't (false positive)", judge_only],
+            ["human flagged, judge didn't (false negative)", human_only],
+        ],
+    )
+    if n and agree / n < 0.8:
+        console.print(
+            "\n[yellow]Agreement below 80%.[/yellow] Per the align-evals guide, "
+            "the fix is to tighten the judge template using the disagreeing "
+            "examples — not to trust the judge's aggregate score yet.\n"
+        )
+
+    look_at(
+        "Annotations → the review queue, with instructions and assigned reviewer.",
+        "Open a queued span in the UI and label it yourself; it lands on the same span.",
+        "A span carrying both `eval.groundedness.*` and `annotation.human_groundedness.*` "
+        "— side by side is how you decide whether the judge is trustworthy.",
+    )
+    done("poc/07_dataset.py — turn the failures into a versioned dataset")
+
+
+if __name__ == "__main__":
+    app()

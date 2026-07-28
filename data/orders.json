@@ -1,0 +1,68 @@
+{
+  "NMB-4471": {
+    "order_id": "NMB-4471",
+    "workspace": "acme-production",
+    "plan": "Business",
+    "status": "active",
+    "amount_usd": 499.0,
+    "billing_period": "2026-07-01 to 2026-07-31",
+    "placed_at": "2026-07-01T08:14:22Z",
+    "payment_method": "Visa ****4242",
+    "notes": "Upgraded from Team on 2026-07-01, prorated $312.90 charged."
+  },
+  "NMB-4489": {
+    "order_id": "NMB-4489",
+    "workspace": "globex-staging",
+    "plan": "Team",
+    "status": "payment_failed",
+    "amount_usd": 99.0,
+    "billing_period": "2026-07-05 to 2026-08-04",
+    "placed_at": "2026-07-05T11:02:09Z",
+    "payment_method": "Mastercard ****8891",
+    "notes": "Charge declined 2026-07-05, retry 1 of 3 failed 2026-07-08."
+  },
+  "NMB-4502": {
+    "order_id": "NMB-4502",
+    "workspace": "initech-prod",
+    "plan": "Team",
+    "status": "cancelled",
+    "amount_usd": 99.0,
+    "billing_period": "2026-06-12 to 2026-07-11",
+    "placed_at": "2026-06-12T16:45:00Z",
+    "payment_method": "Visa ****1177",
+    "notes": "Cancelled 2026-06-28, downgrades to Free at period end 2026-07-11."
+  },
+  "NMB-4518": {
+    "order_id": "NMB-4518",
+    "workspace": "hooli-eu",
+    "plan": "Business",
+    "status": "active",
+    "amount_usd": 623.0,
+    "billing_period": "2026-07-01 to 2026-07-31",
+    "placed_at": "2026-07-01T09:00:11Z",
+    "payment_method": "Invoice (NET-30)",
+    "notes": "Includes $124.00 overage for 124M rows above plan allowance."
+  },
+  "NMB-4530": {
+    "order_id": "NMB-4530",
+    "workspace": "umbrella-analytics",
+    "plan": "Free",
+    "status": "active",
+    "amount_usd": 0.0,
+    "billing_period": "2026-07-01 to 2026-07-31",
+    "placed_at": "2026-02-19T13:30:44Z",
+    "payment_method": "none",
+    "notes": "Hit 500K row cap on 2026-07-19; pipelines paused until 2026-08-01."
+  },
+  "NMB-4547": {
+    "order_id": "NMB-4547",
+    "workspace": "stark-industries",
+    "plan": "Enterprise",
+    "status": "active",
+    "amount_usd": 4200.0,
+    "billing_period": "2026-07-01 to 2026-07-31",
+    "placed_at": "2026-01-04T10:00:00Z",
+    "payment_method": "Invoice (NET-30)",
+    "notes": "Annual contract, billed monthly. Dedicated support channel."
+  }
+}
