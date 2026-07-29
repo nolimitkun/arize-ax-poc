@@ -7,8 +7,13 @@ evaluate → improve**.
 The agent is the instrument, not the point. It is a RAG + tool-use copilot for a
 fictional SaaS ("Nimbus"), wired so that every OpenInference span kind appears in
 the trace tree, and seeded with four failure modes that AX's evaluators are built
-to catch. The tour then fixes those failures and *proves* the fix with an
-experiment.
+to catch. The tour then attempts to fix those failures and puts the fix to a
+statistical test.
+
+That test currently says the fix is **not** proven — see
+[the acceptance criterion](#the-tour). That is a real result, not a broken repo,
+and arguably the more useful demonstration: the loop's job is to tell you when
+you have not improved anything.
 
 ---
 
@@ -45,11 +50,27 @@ no delta. So four failures are built in.
 | Failure mode | How it's seeded | Caught by |
 |---|---|---|
 | **Hallucination** | The KB has no refund page. Retrieval returns *adjacent* chunks (cancellation, billing), and the v1 prompt never says "stay in the context" — so the model invents a refund window. | LLM-as-judge (groundedness) |
-| **Wrong tool** | v1's tool descriptions are one-liners (`"Get order info."`), so order questions get routed to `search_docs`. | Code evaluator on the trajectory |
-| **Missing escalation** | v1 never mentions escalation, so blocked and angry users never reach a human. | Code evaluator |
 | **Verbosity** | v1 says "be thorough" with no length guidance. | Code evaluator |
+| **Wrong tool** | v1's tool descriptions are one-liners (`"Get order info."`), so order questions should get routed to `search_docs`. | Code evaluator on the trajectory |
+| **Missing escalation** | v1 never mentions escalation, so blocked and angry users should never reach a human. | Code evaluator |
 
-`v2` fixes all four. Step 08 measures the difference on identical inputs.
+### The bottom two traps no longer fire
+
+Measured against `deepseek-v4-pro` with thinking on: **8/8** order questions
+called `lookup_order` and **5/5** escalation questions called `escalate_ticket`.
+The model reasons past the deliberately useless tool descriptions every time.
+These traps were designed for a weaker, non-thinking model, and a stronger one
+walks through them.
+
+So **the acceptance criterion is groundedness and conciseness, not escalation** —
+v1 already scores 1.00 on escalation and there is no headroom to improve. The
+first two rows still produce plenty of signal: the judge flags roughly half of
+all v1 answers as ungrounded. If you want the full four-mode demonstration back,
+the traps need recalibrating for a thinking model (making v1's tool descriptions
+actively misleading rather than merely vague), not just re-running.
+
+This is worth dwelling on, because it *is* the point of the tooling: the seeded
+expectation was wrong, and the evaluators are what revealed it.
 
 ---
 
@@ -108,9 +129,38 @@ make monitor    # 10
 make all        # everything, in order
 ```
 
-**The acceptance criterion is step 08.** If v2 doesn't beat v1 on groundedness
-and escalation, the loop hasn't demonstrated anything — re-read the per-row
-explanations in the Arize experiment view before touching the prompt.
+**The acceptance criterion is step 08**, and on the current dataset it is *not*
+met. Measured on 33 examples against `deepseek-v4-pro`:
+
+| evaluator | v1 | v2 | delta | rows changed | McNemar |
+|---|---|---|---|---|---|
+| `answers_from_context` | 0.97 | 1.00 | +0.03 ≈ | 1↑ 0↓ | p=1.000 |
+| `conciseness` | 0.82 | 0.91 | +0.09 ≈ | 3↑ 0↓ | p=0.250 |
+| `groundedness` | 0.55 | 0.52 | −0.03 ≈ | 1↑ 2↓ | p=1.000 |
+
+v2 is not measurably better. Conciseness trends the right way (3 rows fixed,
+none broken) but is underpowered — roughly 5–6 unanimous flips are needed for
+p<0.05 at n=33. Groundedness went slightly *backwards*: v2's "stay in the
+retrieved context" instruction fixed one row and broke two.
+
+Two runs over identical inputs gave conciseness +0.18 then +0.09, and
+groundedness 0.48→0.52 then 0.55→0.52. That swing is bigger than either
+"improvement", which is why step 08 tests significance (paired McNemar, since
+both variants answer the same inputs) rather than trusting a delta. An earlier
+version of this script counted any positive delta as a win, and duly declared
+victory on noise.
+
+**Treat this as the tour working, not failing.** A POC that manufactures a green
+checkmark teaches nothing; the point of the evaluate/improve loop is that it
+tells you when you have *not* improved anything. To get a defensible win: widen
+the dataset (more traffic in step 01 → more graded failures in step 04 → more
+rows in step 07, which raises the detectable effect size), and rewrite v2's
+grounding section, since the measurement says the current wording doesn't work.
+
+Step 07 builds its dataset from step 04's **eval verdicts**, not step 03's
+heuristics. The heuristics are keyword-narrow — `check_ungrounded` only fires on
+refund phrasing and found 1 hallucination in 39 turns, where the judge grading
+every answer flagged ~21. Run step 04 before step 07 or you get the narrow set.
 
 ---
 

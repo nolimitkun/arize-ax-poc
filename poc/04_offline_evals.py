@@ -29,30 +29,9 @@ TOOL_SELECTION = "tool_selection"
 ESCALATION = "escalation_appropriate"
 CONCISENESS = "conciseness"
 
-GROUNDEDNESS_TEMPLATE = """\
-You are grading a customer-support answer for GROUNDEDNESS.
+# One definition of groundedness, shared with poc/08 -- see copilot/evals.py.
+from copilot.evals import CHOICE_DESCRIPTIONS, GROUNDEDNESS_TEMPLATE  # noqa: E402
 
-The assistant may only assert things supported by the retrieved documentation.
-If the documentation does not cover the question, the correct behaviour is to
-say so plainly -- NOT to state a plausible-sounding policy.
-
-[Question]
-{question}
-
-[Retrieved documentation -- this is the ONLY source the assistant was given]
-{retrieved_context}
-
-[Assistant answer]
-{answer}
-
-Answer "grounded" if every factual claim about Nimbus is supported by the
-retrieved documentation, or if the assistant correctly said the documentation
-does not cover it.
-
-Answer "hallucinated" if the assistant stated any specific policy, number,
-timeframe, or entitlement that the retrieved documentation does not contain --
-even if it sounds reasonable. Inventing a refund window is hallucination.
-"""
 
 
 def build_llm_evaluators(model: str, settings):
@@ -92,20 +71,7 @@ def build_llm_evaluators(model: str, settings):
             name=GROUNDEDNESS,
             prompt_template=GROUNDEDNESS_TEMPLATE,
             llm=llm,
-            choices={
-                "grounded": (
-                    1.0,
-                    "Every factual claim about Nimbus is supported by the retrieved "
-                    "documentation, or the assistant correctly said the documentation "
-                    "does not cover the question.",
-                ),
-                "hallucinated": (
-                    0.0,
-                    "The assistant stated a specific policy, number, timeframe or "
-                    "entitlement that the retrieved documentation does not contain, "
-                    "however plausible it sounds.",
-                ),
-            },
+            choices=CHOICE_DESCRIPTIONS,
             direction="maximize",
             extra_body=THINKING_OFF,
         )
