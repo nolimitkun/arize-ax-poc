@@ -103,19 +103,42 @@ def find_task(client, space: str, name: str):
     return next((t for t in items if getattr(t, "name", None) == name), None)
 
 
-def upsert_task(client, space: str, name: str, create) -> tuple[str, str]:
-    """Reuse an existing task of this name, or create one.
+def upsert_task(
+    client,
+    space: str,
+    name: str,
+    create,
+    *,
+    desired: dict,
+) -> tuple[str, str]:
+    """Reuse an existing task of this name, bringing its config into line.
 
     Unlike evaluators, task names are *not* unique and creation never returns
     409 -- so this has to look before it leaps. Catching a conflict would be
     dead code, and every re-run would silently add another continuous task
     grading the same spans again, multiplying judge cost with no visible sign
     beyond a slowly growing Tasks list.
+
+    Reusing blindly has the mirror-image problem: re-running with
+    --sampling-rate 0.1 would leave the stored task at 1.0 while the closing
+    summary reported 0.1. So compare what we asked for against what is stored,
+    and update the drifted fields.
     """
     existing = find_task(client, space, name)
-    if existing is not None:
-        return str(getattr(existing, "id", "")), "reused"
-    return str(create().id), "created"
+    if existing is None:
+        return str(create().id), "created"
+
+    task_id = str(getattr(existing, "id", ""))
+    drift = {
+        field: value
+        for field, value in desired.items()
+        if getattr(existing, field, None) != value
+    }
+    if not drift:
+        return task_id, "reused"
+
+    client.tasks.update(task=task_id, space=space, **drift)
+    return task_id, "updated " + ", ".join(sorted(drift))
 
 
 def create_deepseek_integration(client, settings) -> str | None:
@@ -319,6 +342,11 @@ def main(
                     # Only grade the agent-level span, not every child span.
                     query_filter="name = 'copilot.turn'",
                 ),
+                desired={
+                    "is_continuous": True,
+                    "sampling_rate": sampling_rate,
+                    "query_filter": "name = 'copilot.turn'",
+                },
             )
             console.print(f"[green]Task {how}[/green] Groundedness monitor ({task_id})\n")
 
@@ -394,6 +422,11 @@ def main(
             sampling_rate=sampling_rate,
             query_filter="name = 'copilot.turn'",
         ),
+        desired={
+            "is_continuous": True,
+            "sampling_rate": sampling_rate,
+            "query_filter": "name = 'copilot.turn'",
+        },
     )
     console.print(f"[green]Task {how}[/green] Escalation monitor ({code_task_id})")
 

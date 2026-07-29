@@ -207,6 +207,7 @@ def main(
     console.print(f"Evaluating [bold]{len(turns)}[/bold] agent turns.\n")
 
     results = pd.DataFrame({"context.span_id": turns["span_id"].astype(str)})
+    judge_results = pd.DataFrame()
 
     # ---- code evaluators ------------------------------------------------
     console.print("[bold]Code evaluators[/bold] (deterministic)")
@@ -247,33 +248,71 @@ def main(
             )
         else:
             labels, scores, expl = parsed
-            results[f"eval.{GROUNDEDNESS}.label"] = labels.values
-            results[f"eval.{GROUNDEDNESS}.score"] = scores.values
-            results[f"eval.{GROUNDEDNESS}.explanation"] = expl.values
-            console.print(f"  {GROUNDEDNESS:<24} mean score {scores.mean():.2f}")
+            # A row whose judge call failed has no label and no score.
+            # Arize validates per eval name across the whole frame and rejects
+            # the batch if any row is missing both -- which is the very error
+            # this script exists to avoid -- so the judge results go up as
+            # their own frame covering only the rows that succeeded.
+            ok = labels.notna() & scores.notna()
+            judge_results = pd.DataFrame(
+                {
+                    "context.span_id": results["context.span_id"][ok.values].values,
+                    f"eval.{GROUNDEDNESS}.label": labels[ok].values,
+                    f"eval.{GROUNDEDNESS}.score": scores[ok].values,
+                    f"eval.{GROUNDEDNESS}.explanation": expl[ok].fillna("").values,
+                }
+            )
+            skipped = int((~ok).sum())
+            if skipped:
+                console.print(
+                    f"  [yellow]{skipped} row(s) had no usable judge verdict and are "
+                    f"excluded from the {GROUNDEDNESS} upload.[/yellow]"
+                )
+            if len(judge_results):
+                console.print(
+                    f"  {GROUNDEDNESS:<24} mean score "
+                    f"{judge_results[f'eval.{GROUNDEDNESS}.score'].mean():.2f} "
+                    f"({len(judge_results)} rows)"
+                )
 
     # ---- log back to Arize ----------------------------------------------
     client = arize_client(settings)
     console.print("\nWriting evaluations back onto the spans…")
-    client.spans.update_evaluations(
-        space_id=settings.arize_space_id,
-        project_name=settings.arize_project_name,
-        dataframe=results,
-    )
-    console.print(f"[green]Logged {len(results)} rows.[/green]")
 
-    save("04_evals.parquet", results)
+    def upload(frame: pd.DataFrame, what: str) -> None:
+        if not len(frame):
+            return
+        client.spans.update_evaluations(
+            space_id=settings.arize_space_id,
+            project_name=settings.arize_project_name,
+            dataframe=frame,
+        )
+        console.print(f"[green]Logged {len(frame)} rows[/green] ({what}).")
+
+    upload(results, "code evaluators")
+    upload(judge_results, GROUNDEDNESS)
+
+    # Downstream steps (06's agreement check) read one frame, so merge the two
+    # back together. Rows the judge couldn't grade keep NaN here, which is
+    # honest locally -- it's only the Arize upload that can't carry them.
+    combined = (
+        results.merge(judge_results, on="context.span_id", how="left")
+        if len(judge_results)
+        else results
+    )
+    save("04_evals.parquet", combined)
 
     # ---- summary ---------------------------------------------------------
-    score_cols = [c for c in results.columns if c.endswith(".score")]
+    score_cols = [c for c in combined.columns if c.endswith(".score")]
     table(
         "Evaluation summary",
-        ["evaluator", "mean score", "failing turns"],
+        ["evaluator", "mean score", "graded", "failing turns"],
         [
             [
                 c.removeprefix("eval.").removesuffix(".score"),
-                f"{results[c].mean():.2f}",
-                int((results[c] < 1.0).sum()),
+                f"{combined[c].mean():.2f}",
+                int(combined[c].notna().sum()),
+                int((combined[c] < 1.0).sum()),
             ]
             for c in score_cols
         ],
