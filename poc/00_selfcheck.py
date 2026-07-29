@@ -153,6 +153,41 @@ def check_code_evaluators() -> None:
     label, score, _ = offline.eval_conciseness(pd.Series({"answer_words": 400}))
     check("eval_conciseness labels 400 words `verbose`", label == "verbose" and score == 0.0)
 
+    # Regression: both Phoenix columns start with the evaluator name, and
+    # selecting by prefix silently produced all-NaN scores that Arize rejected.
+    graded = pd.DataFrame(
+        {
+            "groundedness_execution_details": [
+                {"status": "COMPLETED", "exceptions": [], "execution_seconds": 1.0}
+            ],
+            "groundedness_score": [
+                {"name": "groundedness", "score": 0.0, "label": "hallucinated",
+                 "explanation": "invented a refund window"}
+            ],
+        }
+    )
+    parsed = offline.parse_judge_output(graded, "groundedness")
+    check("judge output parses past the _execution_details column", parsed is not None)
+    if parsed:
+        labels, scores, expl = parsed
+        check(
+            "judge score/label read from the right column",
+            scores.iloc[0] == 0.0 and labels.iloc[0] == "hallucinated" and expl.iloc[0],
+            f"got score={scores.iloc[0]!r} label={labels.iloc[0]!r}",
+        )
+    check(
+        "missing judge column is reported, not silently NaN",
+        offline.parse_judge_output(pd.DataFrame({"other": [1]}), "groundedness") is None,
+    )
+    check(
+        "per-row judge exceptions are surfaced",
+        offline.judge_failures(
+            pd.DataFrame({"groundedness_execution_details": [{"exceptions": ["boom"]}]}),
+            "groundedness",
+        )
+        != [],
+    )
+
 
 def check_prompts_and_tools() -> None:
     console.print("\n[bold]Prompts and tool schemas[/bold]")

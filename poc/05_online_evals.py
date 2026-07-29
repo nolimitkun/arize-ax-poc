@@ -75,6 +75,49 @@ def evaluate(tool_calls, output):
 INTEGRATION_NAME = "deepseek-poc"
 
 
+def evaluator_id(obj) -> str:
+    return str(getattr(obj, "id", None) or getattr(getattr(obj, "evaluator", None), "id", ""))
+
+
+def upsert_evaluator(client, space: str, name: str, create, new_version) -> tuple[str, str]:
+    """Create an evaluator, or add a version to the one that's already there.
+
+    Evaluators are versioned, so "already exists" is not an error condition --
+    it's the second run. Without this, any partial failure downstream (a task
+    that won't create, say) leaves the evaluator behind and every retry 409s,
+    which is a miserable way to re-run a tour. Returns (id, what_happened).
+    """
+    from arize._generated.api_client.exceptions import ConflictException
+
+    try:
+        return evaluator_id(create()), "created"
+    except ConflictException:
+        new_version()
+        existing = client.evaluators.get(evaluator=name, space=space)
+        return evaluator_id(existing), "new version"
+
+
+def find_task(client, space: str, name: str):
+    listed = client.tasks.list(space=space, limit=100)
+    items = getattr(listed, "data", None) or getattr(listed, "tasks", [])
+    return next((t for t in items if getattr(t, "name", None) == name), None)
+
+
+def upsert_task(client, space: str, name: str, create) -> tuple[str, str]:
+    """Reuse an existing task of this name, or create one.
+
+    Unlike evaluators, task names are *not* unique and creation never returns
+    409 -- so this has to look before it leaps. Catching a conflict would be
+    dead code, and every re-run would silently add another continuous task
+    grading the same spans again, multiplying judge cost with no visible sign
+    beyond a slowly growing Tasks list.
+    """
+    existing = find_task(client, space, name)
+    if existing is not None:
+        return str(getattr(existing, "id", "")), "reused"
+    return str(create().id), "created"
+
+
 def create_deepseek_integration(client, settings) -> str | None:
     """Register DeepSeek in the Arize space as a custom OpenAI-compatible provider.
 
@@ -137,6 +180,27 @@ def resolve_integration(client, settings) -> str | None:
     return None
 
 
+def summarise(created: list[tuple[str, str, str]], sampling_rate: float) -> None:
+    """Closing report. Shared, because the code-evaluator path may bail early."""
+    table(
+        "Created",
+        ["kind", "name", "evaluator id"],
+        [[k, n, i] for k, n, i in created],
+    )
+    console.print(
+        f"\n[bold]These are continuous[/bold] at a sampling rate of {sampling_rate:g}. "
+        "Re-run poc/01_trace.py to send fresh traffic; within a few minutes the "
+        "new spans carry eval results with no code involved.\n"
+    )
+    look_at(
+        "Eval Hub → the evaluators, with their versions and templates.",
+        "Tasks → cadence, sampling rate and filter for each monitor.",
+        "Traces (after new traffic) → `eval.Groundedness.label` appearing automatically.",
+        "Edit the template in the UI, save a version, and note that the task picks it up.",
+    )
+    done("poc/06_annotations.py — human review, and judge-vs-human agreement")
+
+
 @app.command()
 def main(
     model_name: str = typer.Option("deepseek-v4-pro", help="Model the online judge uses"),
@@ -186,105 +250,154 @@ def main(
             )
         else:
             console.print(f"Using AI integration [bold]{integration_id}[/bold]")
-            evaluator = client.evaluators.create_template_evaluator(
+            groundedness_config = TemplateConfig(
                 name="Groundedness",
-                space=space,
-                commit_message="Flag support answers that invent undocumented policy",
-                description="Catches confident answers on topics the KB doesn't cover.",
-                template_config=TemplateConfig(
-                    name="Groundedness",
-                    template=GROUNDEDNESS_TEMPLATE,
-                    classification_choices={"grounded": 1, "hallucinated": 0},
-                    direction=OptimizationDirection.MAXIMIZE,
-                    include_explanations=True,
-                    use_function_calling_if_available=True,
-                    llm_config=EvaluatorLlmConfig(
-                        ai_integration_id=integration_id,
-                        model_name=model_name,
-                        invocation_parameters={},
-                        provider_parameters={},
-                    ),
+                template=GROUNDEDNESS_TEMPLATE,
+                classification_choices={"grounded": 1, "hallucinated": 0},
+                direction=OptimizationDirection.MAXIMIZE,
+                include_explanations=True,
+                # Both of AX's structured-output mechanisms are unusable
+                # against DeepSeek V4, for the same reasons poc/04 hits
+                # locally: `response_format: json_schema` is unsupported, and a
+                # forced tool_choice is rejected while thinking mode is on (it
+                # is on by default, and there is no reliable seam to disable it
+                # from here -- InvocationParams has no `thinking` field).
+                # Turning both off makes the judge emit a plain-text label,
+                # which works either way.
+                use_function_calling_if_available=False,
+                use_structured_output=False,
+                llm_config=EvaluatorLlmConfig(
+                    ai_integration_id=integration_id,
+                    model_name=model_name,
+                    invocation_parameters={},
+                    provider_parameters={},
                 ),
             )
-            eval_id = getattr(evaluator, "id", None) or getattr(evaluator.evaluator, "id")
-            created.append(("template", "Groundedness", str(eval_id)))
-            console.print(f"[green]Created template evaluator[/green] Groundedness ({eval_id})")
-
-            task = client.tasks.create_evaluation_task(
-                name="Groundedness monitor",
-                task_type=TaskType.TEMPLATE_EVALUATION,
-                project=settings.arize_project_name,
-                evaluators=[
-                    TaskEvaluatorInput(
-                        evaluator_id=str(eval_id),
-                        column_mappings={
-                            "input.value": "attributes.input.value",
-                            "output.value": "attributes.output.value",
-                        },
-                    )
-                ],
-                is_continuous=True,
-                sampling_rate=sampling_rate,
-                # Only grade the agent-level span, not every child span.
-                query_filter="name = 'copilot.turn'",
+            eval_id, how = upsert_evaluator(
+                client,
+                space,
+                "Groundedness",
+                lambda: client.evaluators.create_template_evaluator(
+                    name="Groundedness",
+                    space=space,
+                    commit_message="Flag support answers that invent undocumented policy",
+                    description="Catches confident answers on topics the KB doesn't cover.",
+                    template_config=groundedness_config,
+                ),
+                lambda: client.evaluators.create_template_version(
+                    evaluator="Groundedness",
+                    space=space,
+                    commit_message="Text-mode labels: DeepSeek V4 rejects json_schema "
+                    "and forced tool_choice under thinking mode",
+                    template_config=groundedness_config,
+                ),
             )
-            console.print(f"[green]Created task[/green] Groundedness monitor ({task.id})\n")
+            created.append(("template", "Groundedness", eval_id))
+            console.print(f"[green]Template evaluator {how}[/green] Groundedness ({eval_id})")
+
+            task_id, how = upsert_task(
+                client,
+                space,
+                "Groundedness monitor",
+                lambda: client.tasks.create_evaluation_task(
+                    name="Groundedness monitor",
+                    task_type=TaskType.TEMPLATE_EVALUATION,
+                    project=settings.arize_project_name,
+                    # space is required for the project *name* to resolve.
+                    space=space,
+                    evaluators=[
+                        TaskEvaluatorInput(
+                            evaluator_id=eval_id,
+                            column_mappings={
+                                "input.value": "attributes.input.value",
+                                "output.value": "attributes.output.value",
+                            },
+                        )
+                    ],
+                    is_continuous=True,
+                    sampling_rate=sampling_rate,
+                    # Only grade the agent-level span, not every child span.
+                    query_filter="name = 'copilot.turn'",
+                ),
+            )
+            console.print(f"[green]Task {how}[/green] Groundedness monitor ({task_id})\n")
 
     # ---- 2. Online code evaluator ---------------------------------------
-    code_evaluator = client.evaluators.create_code_evaluator(
+    #
+    # Online *code* evaluators are a paid entitlement. On an account without
+    # them the API returns 400 "Custom code evals are not available for your
+    # account", which is a plan boundary rather than a broken script -- so say
+    # so and let the rest of the tour proceed. The same logic already ran
+    # locally in poc/04, so nothing is left undemonstrated; only the
+    # in-platform continuous version is unavailable.
+    escalation_config = CustomCodeConfig(
+        type="CUSTOM",
         name="EscalationAppropriate",
-        space=space,
-        commit_message="Flag distressed turns that never escalated",
-        description="Deterministic check on the agent's escalation trajectory.",
-        code_config=CustomCodeConfig(
-            type="custom",
-            name="EscalationAppropriate",
-            code=ESCALATION_CODE,
-            variables=["tool_calls", "output"],
+        code=ESCALATION_CODE,
+        variables=["tool_calls", "output"],
+    )
+    try:
+        code_id, how = upsert_evaluator(
+            client,
+            space,
+            "EscalationAppropriate",
+            lambda: client.evaluators.create_code_evaluator(
+                name="EscalationAppropriate",
+                space=space,
+                commit_message="Flag distressed turns that never escalated",
+                description="Deterministic check on the agent's escalation trajectory.",
+                code_config=escalation_config,
+            ),
+            lambda: client.evaluators.create_code_version(
+                evaluator="EscalationAppropriate",
+                space=space,
+                commit_message="Refresh escalation trajectory check",
+                code_config=escalation_config,
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        if "not available for your account" not in str(exc):
+            raise
+        console.print(
+            "\n[yellow]Online code evaluators are not enabled on this account.[/yellow]\n"
+            "  That's a plan entitlement, not a failure of this script. The same\n"
+            "  escalation check already ran locally in poc/04 and its results are\n"
+            "  on your spans; what's unavailable is running it continuously\n"
+            "  inside AX. The online LLM judge above is unaffected.\n"
+        )
+        summarise(created, sampling_rate)
+        return
+
+    created.append(("code", "EscalationAppropriate", code_id))
+    console.print(f"[green]Code evaluator {how}[/green] EscalationAppropriate ({code_id})")
+
+    code_task_id, how = upsert_task(
+        client,
+        space,
+        "Escalation monitor",
+        lambda: client.tasks.create_evaluation_task(
+            name="Escalation monitor",
+            task_type=TaskType.CODE_EVALUATION,
+            project=settings.arize_project_name,
+            # space is required for the project *name* to resolve to an id.
+            space=space,
+            evaluators=[
+                TaskEvaluatorInput(
+                    evaluator_id=code_id,
+                    column_mappings={
+                        "tool_calls": "attributes.copilot.tool_calls",
+                        "output": "attributes.output.value",
+                    },
+                )
+            ],
+            is_continuous=True,
+            sampling_rate=sampling_rate,
+            query_filter="name = 'copilot.turn'",
         ),
     )
-    code_id = getattr(code_evaluator, "id", None) or getattr(code_evaluator.evaluator, "id")
-    created.append(("code", "EscalationAppropriate", str(code_id)))
-    console.print(f"[green]Created code evaluator[/green] EscalationAppropriate ({code_id})")
+    console.print(f"[green]Task {how}[/green] Escalation monitor ({code_task_id})")
 
-    code_task = client.tasks.create_evaluation_task(
-        name="Escalation monitor",
-        task_type=TaskType.CODE_EVALUATION,
-        project=settings.arize_project_name,
-        evaluators=[
-            TaskEvaluatorInput(
-                evaluator_id=str(code_id),
-                column_mappings={
-                    "tool_calls": "attributes.copilot.tool_calls",
-                    "output": "attributes.output.value",
-                },
-            )
-        ],
-        is_continuous=True,
-        sampling_rate=sampling_rate,
-        query_filter="name = 'copilot.turn'",
-    )
-    console.print(f"[green]Created task[/green] Escalation monitor ({code_task.id})")
-
-    table(
-        "Created",
-        ["kind", "name", "evaluator id"],
-        [[k, n, i] for k, n, i in created],
-    )
-
-    console.print(
-        "\n[bold]These are continuous.[/bold] Re-run poc/01_trace.py to send fresh "
-        "traffic; within a few minutes the new spans carry eval results with no "
-        "code involved.\n"
-    )
-
-    look_at(
-        "Eval Hub → the two evaluators, with their versions and templates.",
-        "Tasks → cadence, sampling rate and filter for each monitor.",
-        "Traces (after new traffic) → `eval.Groundedness.label` appearing automatically.",
-        "Edit the template in the UI, save a version, and note that the task picks it up.",
-    )
-    done("poc/06_annotations.py — human review, and judge-vs-human agreement")
+    summarise(created, sampling_rate)
 
 
 if __name__ == "__main__":

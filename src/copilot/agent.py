@@ -32,17 +32,12 @@ import openai
 from openinference.instrumentation import using_attributes
 from openinference.semconv.trace import OpenInferenceSpanKindValues
 
-from .config import AGENT_MODEL, ROUTER_MODEL, Settings
+from .config import AGENT_MODEL, ROUTER_MODEL, THINKING_OFF, THINKING_ON, Settings
 from .prompts import load_prompt
 from .tools import ToolContext, execute, tools_for
 from .tracing import set_output, span
 
 MAX_TOOL_ITERATIONS = 6
-
-# `thinking` is a DeepSeek extension, so it travels in extra_body -- the openai
-# SDK raises TypeError on unrecognised keyword arguments.
-THINKING_ON = {"thinking": {"type": "enabled"}}
-THINKING_OFF = {"thinking": {"type": "disabled"}}
 
 
 @dataclass

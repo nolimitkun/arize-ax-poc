@@ -39,8 +39,8 @@ say so plainly -- NOT to state a plausible-sounding policy.
 [Question]
 {question}
 
-[Retrieved documentation IDs]
-{retrieved_doc_ids}
+[Retrieved documentation -- this is the ONLY source the assistant was given]
+{retrieved_context}
 
 [Assistant answer]
 {answer}
@@ -56,18 +56,30 @@ even if it sounds reasonable. Inventing a refund window is hallucination.
 
 
 def build_llm_evaluators(model: str, settings):
-    """Phoenix Evals against DeepSeek, via its OpenAI-compatible endpoint.
+    """Phoenix Evals against DeepSeek V4, via its OpenAI-compatible endpoint.
 
-    Phoenix's `openai` adapter first tries `response_format: json_schema` for
-    structured output. DeepSeek rejects that with a 400, and Phoenix falls back
-    to tool calling and caches the choice for the rest of the run -- so expect
-    one discarded request at startup, then normal throughput.
+    Two DeepSeek constraints collide with Phoenix's defaults here, and both
+    surface as a 400 raised from deep inside the adapter:
 
-    The judge runs with V4's default thinking mode on: Phoenix forwards kwargs
-    to the client constructor, not to each request, so there's no seam here to
-    pass `thinking: disabled` through. Slower per row, better grading.
+      * `response_format: json_schema` is not supported at all, so Phoenix's
+        preferred structured-output path fails on every row.
+      * its tool-calling fallback pins `tool_choice` to one named function, and
+        V4 rejects a forced tool_choice while thinking mode is on -- which it
+        is by default. So the fallback fails too, and the row errors out.
+
+    Both are fixed here without patching Phoenix. `ClassificationEvaluator`
+    forwards **kwargs to the chat-completions call as invocation parameters,
+    which is the seam for turning thinking off (`create_classifier` does not
+    accept them, hence constructing the evaluator directly). And giving each
+    choice a `(score, description)` tuple makes Phoenix treat the labels as a
+    dict, which routes it straight to tool calling instead of burning a failed
+    structured-output request first -- while also telling the judge what the
+    labels actually mean.
     """
-    from phoenix.evals import LLM, create_classifier
+    from phoenix.evals import LLM
+    from phoenix.evals.evaluators import ClassificationEvaluator
+
+    from copilot.config import THINKING_OFF
 
     llm = LLM(
         provider="openai",
@@ -76,12 +88,26 @@ def build_llm_evaluators(model: str, settings):
         base_url=settings.deepseek_base_url,
     )
     return [
-        create_classifier(
+        ClassificationEvaluator(
             name=GROUNDEDNESS,
             prompt_template=GROUNDEDNESS_TEMPLATE,
             llm=llm,
-            choices={"grounded": 1.0, "hallucinated": 0.0},
+            choices={
+                "grounded": (
+                    1.0,
+                    "Every factual claim about Nimbus is supported by the retrieved "
+                    "documentation, or the assistant correctly said the documentation "
+                    "does not cover the question.",
+                ),
+                "hallucinated": (
+                    0.0,
+                    "The assistant stated a specific policy, number, timeframe or "
+                    "entitlement that the retrieved documentation does not contain, "
+                    "however plausible it sounds.",
+                ),
+            },
             direction="maximize",
+            extra_body=THINKING_OFF,
         )
     ]
 
@@ -131,6 +157,38 @@ CODE_EVALUATORS = {
 }
 
 
+# --- reading Phoenix's output ---------------------------------------------
+#
+# evaluate_dataframe returns two columns per evaluator: `<name>_score`, holding
+# a dict of {score, label, explanation}, and `<name>_execution_details`. Both
+# begin with the evaluator name, so selecting by prefix picks the details
+# column and yields a frame of NaN scores that Arize then rejects for having
+# neither a label nor a score. Match exactly.
+
+
+def parse_judge_output(graded: pd.DataFrame, name: str):
+    """(labels, scores, explanations) for one evaluator, or None if absent."""
+    col = f"{name}_score"
+    if col not in graded.columns:
+        return None
+
+    def field(key: str, default=None):
+        return graded[col].apply(lambda v: v.get(key, default) if isinstance(v, dict) else default)
+
+    return field("label"), field("score").astype(float), field("explanation", "")
+
+
+def judge_failures(graded: pd.DataFrame, name: str) -> list[str]:
+    """Per-row judge exceptions, which Phoenix records rather than raising."""
+    col = f"{name}_execution_details"
+    if col not in graded.columns:
+        return []
+    failed = [d for d in graded[col] if isinstance(d, dict) and d.get("exceptions")]
+    if not failed:
+        return []
+    return [f"{len(failed)}/{len(graded)} rows failed in the judge; first: {failed[0]['exceptions'][0]}"]
+
+
 @app.command()
 def main(
     judge_model: str = typer.Option("deepseek-v4-pro", help="Model backing the LLM judge"),
@@ -165,32 +223,34 @@ def main(
         console.print(f"\n[bold]LLM-as-a-judge[/bold] (Phoenix Evals, {judge_model})")
         from phoenix.evals import evaluate_dataframe
 
-        judge_input = turns[["question", "answer", "retrieved_doc_ids"]].copy()
-        judge_input["retrieved_doc_ids"] = judge_input["retrieved_doc_ids"].replace(
-            "", "(nothing retrieved)"
+        from copilot.kb import context_for_ids
+
+        judge_input = turns[["question", "answer"]].copy()
+        # The judge needs the documentation text, not the ids -- see
+        # context_for_ids. Grading groundedness from ids alone is guesswork.
+        judge_input["retrieved_context"] = turns["retrieved_doc_ids"].apply(
+            lambda ids: context_for_ids([i for i in str(ids).split(",") if i])
         )
         graded = evaluate_dataframe(
             dataframe=judge_input,
             evaluators=build_llm_evaluators(judge_model, settings),
         )
 
-        col = next((c for c in graded.columns if c.startswith(GROUNDEDNESS)), None)
-        if col is None:
-            console.print(f"[red]Judge produced no '{GROUNDEDNESS}' column[/red]")
+        for note in judge_failures(graded, GROUNDEDNESS):
+            console.print(f"  [yellow]{note}[/yellow]")
+
+        parsed = parse_judge_output(graded, GROUNDEDNESS)
+        if parsed is None:
+            console.print(
+                f"[red]Judge produced no '{GROUNDEDNESS}_score' column[/red] "
+                f"(got {list(graded.columns)})"
+            )
         else:
-            scores = graded[col].apply(
-                lambda v: v.get("score") if isinstance(v, dict) else None
-            )
-            labels = graded[col].apply(
-                lambda v: v.get("label") if isinstance(v, dict) else None
-            )
-            expl = graded[col].apply(
-                lambda v: v.get("explanation", "") if isinstance(v, dict) else ""
-            )
+            labels, scores, expl = parsed
             results[f"eval.{GROUNDEDNESS}.label"] = labels.values
-            results[f"eval.{GROUNDEDNESS}.score"] = scores.astype(float).values
+            results[f"eval.{GROUNDEDNESS}.score"] = scores.values
             results[f"eval.{GROUNDEDNESS}.explanation"] = expl.values
-            console.print(f"  {GROUNDEDNESS:<24} mean score {scores.astype(float).mean():.2f}")
+            console.print(f"  {GROUNDEDNESS:<24} mean score {scores.mean():.2f}")
 
     # ---- log back to Arize ----------------------------------------------
     client = arize_client(settings)
