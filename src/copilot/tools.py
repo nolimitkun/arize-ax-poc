@@ -52,10 +52,27 @@ def _load_orders() -> dict[str, dict[str, Any]]:
 
 
 def search_docs(ctx: ToolContext, query: str) -> str:
+    """Search the corpus, accumulating what the turn has been shown.
+
+    The agent may search several times in one turn, and every earlier result
+    stays in the conversation -- so the answer can legitimately draw on any of
+    them. Recording only the last search would under-report the context and
+    make an offline groundedness judge call supported claims hallucinated.
+    The return value is just this search, which is what the model asked for.
+    """
     hits = search_traced(query)
-    ctx.retrieved_doc_ids = [c.doc_id for c, _ in hits]
-    ctx.retrieved_context = format_context(hits)
-    return ctx.retrieved_context
+    context = format_context(hits)
+
+    for chunk, _ in hits:
+        if chunk.doc_id not in ctx.retrieved_doc_ids:
+            ctx.retrieved_doc_ids.append(chunk.doc_id)
+    if context not in ctx.retrieved_context:
+        ctx.retrieved_context = (
+            f"{ctx.retrieved_context}\n\n---\n\n{context}"
+            if ctx.retrieved_context
+            else context
+        )
+    return context
 
 
 def lookup_order(ctx: ToolContext, order_id: str) -> str:

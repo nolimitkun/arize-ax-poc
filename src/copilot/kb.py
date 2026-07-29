@@ -14,6 +14,7 @@ from collections import Counter
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from typing import Iterable
 
 from openinference.semconv.trace import (
     DocumentAttributes,
@@ -147,3 +148,18 @@ def format_context(hits: list[tuple[Chunk, float]]) -> str:
     if not hits:
         return "(no matching documentation found)"
     return "\n\n---\n\n".join(f"SOURCE: {c.doc_id}\n{c.text}" for c, _ in hits)
+
+
+def context_for_ids(doc_ids: Iterable[str]) -> str:
+    """Rebuild the retrieved context from doc ids alone.
+
+    Offline evaluation needs the documentation *text*, not just which chunks
+    were hit -- a groundedness judge given only ids has to guess, and will.
+    The corpus is local and immutable, so ids are enough to reconstruct exactly
+    what the agent was shown.
+    """
+    chunks = {c.doc_id: c for c in _index()[0]}
+    wanted = [chunks[i] for i in doc_ids if i in chunks]
+    if not wanted:
+        return "(no matching documentation found)"
+    return "\n\n---\n\n".join(f"SOURCE: {c.doc_id}\n{c.text}" for c in wanted)

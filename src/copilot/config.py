@@ -55,6 +55,16 @@ _REQUIRED = {
 # OpenAIInstrumentor produces correct LLM spans for it.
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 
+# `thinking` is a DeepSeek extension rather than part of the OpenAI schema, so
+# it travels in extra_body -- the openai SDK raises TypeError on unrecognised
+# keyword arguments. It is enabled by default on V4, and turning it off is
+# sometimes required rather than merely cheaper: a forced `tool_choice` is
+# rejected while thinking is on, which is what the Phoenix judge in poc/04
+# needs, and a small max_tokens budget gets consumed entirely by the CoT,
+# which is what the intent router in agent.py needs.
+THINKING_ON: dict = {"thinking": {"type": "enabled"}}
+THINKING_OFF: dict = {"thinking": {"type": "disabled"}}
+
 
 # --------------------------------------------------------------------------
 # Region

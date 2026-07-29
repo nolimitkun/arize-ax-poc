@@ -153,6 +153,95 @@ def check_code_evaluators() -> None:
     label, score, _ = offline.eval_conciseness(pd.Series({"answer_words": 400}))
     check("eval_conciseness labels 400 words `verbose`", label == "verbose" and score == 0.0)
 
+    # Regression: both Phoenix columns start with the evaluator name, and
+    # selecting by prefix silently produced all-NaN scores that Arize rejected.
+    graded = pd.DataFrame(
+        {
+            "groundedness_execution_details": [
+                {"status": "COMPLETED", "exceptions": [], "execution_seconds": 1.0}
+            ],
+            "groundedness_score": [
+                {"name": "groundedness", "score": 0.0, "label": "hallucinated",
+                 "explanation": "invented a refund window"}
+            ],
+        }
+    )
+    parsed = offline.parse_judge_output(graded, "groundedness")
+    check("judge output parses past the _execution_details column", parsed is not None)
+    if parsed:
+        labels, scores, expl = parsed
+        check(
+            "judge score/label read from the right column",
+            scores.iloc[0] == 0.0 and labels.iloc[0] == "hallucinated" and expl.iloc[0],
+            f"got score={scores.iloc[0]!r} label={labels.iloc[0]!r}",
+        )
+    check(
+        "missing judge column is reported, not silently NaN",
+        offline.parse_judge_output(pd.DataFrame({"other": [1]}), "groundedness") is None,
+    )
+    check(
+        "per-row judge exceptions are surfaced",
+        offline.judge_failures(
+            pd.DataFrame({"groundedness_execution_details": [{"exceptions": ["boom"]}]}),
+            "groundedness",
+        )
+        != [],
+    )
+
+    # A failed judge row yields label=None/score=NaN. Uploading it alongside
+    # good rows makes Arize reject the whole batch, so it must be filterable.
+    mixed = pd.DataFrame(
+        {
+            "groundedness_score": [
+                {"score": 1.0, "label": "grounded", "explanation": "ok"},
+                {},
+            ]
+        }
+    )
+    labels, scores, _ = offline.parse_judge_output(mixed, "groundedness")
+    usable = labels.notna() & scores.notna()
+    check(
+        "failed judge rows are distinguishable from graded ones",
+        usable.tolist() == [True, False],
+        f"got {usable.tolist()}",
+    )
+
+
+def check_retrieval_accumulates() -> None:
+    """A turn may search twice; the record must cover both, not just the last."""
+    console.print("\n[bold]Retrieval accumulation[/bold]")
+    from copilot.tools import ToolContext, search_docs
+
+    # search_traced emits a RETRIEVER span, so it needs a tracer. Install a
+    # local provider with no exporter -- this keeps the check offline while
+    # still exercising the real code path rather than a stubbed one.
+    import copilot.tracing as tracing
+
+    if tracing._TRACER is None:
+        from opentelemetry.sdk.trace import TracerProvider
+
+        tracing._TRACER = TracerProvider().get_tracer("selfcheck")
+        tracing._INITIALIZED = True
+
+    ctx = ToolContext()
+    first = search_docs(ctx, "What scopes can an API key have?")
+    after_first = list(ctx.retrieved_doc_ids)
+    second = search_docs(ctx, "How many times do you retry a failed webhook?")
+
+    check("each search returns only its own hits", first != second and bool(first))
+    check(
+        "doc ids accumulate across searches",
+        set(after_first) < set(ctx.retrieved_doc_ids),
+        f"{after_first} -> {ctx.retrieved_doc_ids}",
+    )
+    check(
+        "recorded context keeps the earlier search too",
+        first in ctx.retrieved_context and second in ctx.retrieved_context,
+    )
+    ids_before = list(ctx.retrieved_doc_ids)
+    search_docs(ctx, "What scopes can an API key have?")
+    check("repeating a search does not duplicate ids", ctx.retrieved_doc_ids == ids_before)
+
 
 def check_prompts_and_tools() -> None:
     console.print("\n[bold]Prompts and tool schemas[/bold]")
@@ -369,6 +458,7 @@ def main() -> None:
     check_knowledge_base()
     check_questions()
     check_code_evaluators()
+    check_retrieval_accumulates()
     check_prompts_and_tools()
     check_dataframe_contracts()
     check_targets_ax_not_phoenix()
