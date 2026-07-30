@@ -181,9 +181,48 @@ the `copilot-failures` dataset in Playground, edit the system prompt against
 those exact inputs, and watch the answers change side by side. Step 08 is the
 automated version of the same idea.
 
-**Step 10 needs a GraphQL key.** Monitors and dashboards aren't in the Python
-SDK — they're behind the GraphQL API. The script prints the exact mutation and
-applies it with `--apply` if `ARIZE_GRAPHQL_API_KEY` is set.
+**Step 10 uses GraphQL, and writes are enterprise-only.** Monitors and dashboards
+aren't in the Python SDK. `ARIZE_API_KEY` authenticates against GraphQL with the
+`x-api-key` header, so no separate key is needed (`ARIZE_GRAPHQL_API_KEY` still
+wins if set), and the endpoint is region-derived like every other host here.
+Reads work on any plan — that is how the script's dimension names were verified
+against the live schema — but `--apply` returns *"GraphQL Mutation access is only
+available for enterprise accounts"*. The script prints the exact settings and
+degrades to a "create these by hand" message; the monitor configuration is
+identical either way.
+
+An eval score is a **dimension**, not a performance metric: `PerformanceMetric`
+is the classic-ML enum (`accuracy`, `auc`, `rmse`, …) and
+`CreatePerformanceMonitorMutationInput` has no field for an eval column at all.
+Eval monitors are therefore `createDataQualityMonitor` with
+`dimensionCategory: llmEval`, `dimensionName: "eval.<name>.score"` and an
+aggregation (`avg`). Latency is `latency_ms` under `spanProperty` with `p95`.
+
+---
+
+## Two things steps 09 and 10 surface
+
+**Step 09 promotes v2, and step 08 says v2 isn't proven.** The `production`
+label is a pointer, not an endorsement — the step demonstrates that moving it
+changes runtime behaviour with no code change, and moving it back is the
+rollback. Its verification probe is worth reading: v2, loaded from Prompt Hub,
+still answers "no, there are no prorated refunds." The KB documents that
+cancellation stops future charges and says *nothing* about proration, so that
+answer is inferred from an adjacent policy — the exact move v2's own grounding
+section forbids. That is the same finding step 08 measured, in one concrete row.
+
+**Eval column names are case-sensitive, and collisions are invisible.** Columns
+are keyed by the evaluator's name verbatim, so an online evaluator named
+`Groundedness` (step 05) and step 04's `groundedness` are two unrelated metrics:
+
+```
+eval.Groundedness.score   mean 0.33    3 rows   ← online, from step 05
+eval.groundedness.score   mean 0.46   39 rows   ← offline, from step 04
+```
+
+A monitor can only watch one, and the other regresses unwatched — while the
+monitor sits green. Step 10 flags the collision and repoints a monitor whose
+metric differs from the logged column only by case.
 
 Also worth trying by hand: **Alyx**, which can author an evaluator from a
 natural-language description, and **Agent Studio**.

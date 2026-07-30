@@ -59,12 +59,38 @@ document by name when you rely on it."""
 _LOCAL = {"v1": V1, "v2": V2}
 
 
-def load_prompt(version: str, *, settings=None) -> str:
+def system_text(published) -> str:
+    """Pull the system prompt out of what `prompts.get()` returns.
+
+    Two details that a `getattr(published, "messages")` guess gets wrong:
+    `get()` returns a `PromptWithVersion`, so the messages hang off
+    `.version`, not off the prompt; and roles come back upper-case
+    (`SYSTEM`), so a `== "system"` comparison silently matches nothing.
+    Both produce an empty string rather than an error, which is why this is
+    separated out and asserted offline in poc/00.
+    """
+    container = getattr(published, "version", None) or published
+    messages = getattr(container, "messages", None) or []
+    parts = []
+    for message in messages:
+        role = getattr(message, "role", "")
+        role = getattr(role, "value", role)
+        if str(role).lower() == "system" and getattr(message, "content", None):
+            parts.append(message.content)
+    return "\n\n".join(parts)
+
+
+def load_prompt(version: str, *, settings=None, strict: bool = False) -> str:
     """Resolve a system prompt.
 
     `v1` / `v2` come from this file. `hub` fetches the `production`-labelled
     version from Arize Prompt Hub, falling back to V2 with a warning if the
     prompt has not been published yet (i.e. poc/09 has not run).
+
+    `strict=True` raises instead of falling back. Serving traffic wants the
+    fallback -- a Prompt Hub outage shouldn't take the agent down. A script
+    demonstrating that runtime loading works wants the opposite: silently
+    serving the local copy makes a broken fetch look like a successful one.
     """
     version = (version or "v1").lower()
     if version in _LOCAL:
@@ -72,24 +98,26 @@ def load_prompt(version: str, *, settings=None) -> str:
     if version != "hub":
         raise ValueError(f"Unknown prompt version {version!r}; expected v1, v2, or hub")
 
-    from arize.client import ArizeClient
-
-    from .config import settings_or_exit
+    from .config import platform_client, settings_or_exit
 
     cfg = settings or settings_or_exit()
     try:
-        client = ArizeClient(api_key=cfg.arize_api_key)
+        # Region matters here: an EU key against the default host fails auth,
+        # and the fallback below would report that as "not published yet" while
+        # quietly serving local V2 -- so the runtime-load demo would look like
+        # it worked while proving nothing.
+        client = platform_client(cfg)
         published = client.prompts.get(
             prompt=PROMPT_NAME, space=cfg.arize_space_name, label="production"
         )
-        text = "\n\n".join(
-            m.content for m in published.messages if getattr(m, "role", "") == "system"
-        )
+        text = system_text(published)
         if not text.strip():
             raise ValueError("published prompt has no system message")
         print(f"[prompts] loaded '{PROMPT_NAME}' @ production from Arize Prompt Hub")
         return text
     except Exception as exc:  # noqa: BLE001 - fallback is the point
+        if strict:
+            raise
         print(
             f"[prompts] could not load '{PROMPT_NAME}' @ production ({exc}); "
             "falling back to local V2. Run poc/09_prompt_hub.py to publish it.",

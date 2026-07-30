@@ -291,6 +291,182 @@ def check_judge_verdict_parsing() -> None:
     check("unparseable output is quoted back for debugging", "maybe?" in why, why)
 
 
+def check_prompt_hub_plumbing() -> None:
+    """Every failure here is silent: it serves a local copy and calls it success."""
+    console.print("\n[bold]Prompt Hub plumbing[/bold]")
+    from importlib import import_module
+
+    from copilot.prompts import system_text
+
+    class Msg:
+        def __init__(self, role, content):
+            self.role, self.content = role, content
+
+    class Version:
+        def __init__(self, messages):
+            self.messages = messages
+
+    class PromptWithVersion:
+        """What prompts.get() actually returns -- messages hang off .version."""
+
+        def __init__(self, messages):
+            self.version = Version(messages)
+
+    check(
+        "messages are read from .version, not off the prompt",
+        system_text(PromptWithVersion([Msg("SYSTEM", "hello")])) == "hello",
+    )
+    check(
+        "upper-case SYSTEM role is matched",
+        system_text(Version([Msg("SYSTEM", "hello")])) == "hello",
+    )
+
+    class Enumish:
+        value = "SYSTEM"
+
+    check(
+        "an enum role is unwrapped, not str()'d into 'MessageRole.SYSTEM'",
+        system_text(Version([Msg(Enumish(), "hello")])) == "hello",
+    )
+    check("non-system messages are ignored", system_text(Version([Msg("USER", "hi")])) == "")
+
+    # The dedupe helper reads the prompt name from its argument: poc/09 imports
+    # PROMPT_NAME inside main(), so a module-global reference raises NameError
+    # into a broad except and republishes everything on every run.
+    hub = import_module("09_prompt_hub")
+    import inspect
+
+    check(
+        "list_versions takes the prompt name rather than reaching for a global",
+        "prompt_name" in inspect.signature(hub.list_versions).parameters,
+    )
+    versions = [Version([Msg("SYSTEM", "v1 text")]), Version([Msg("SYSTEM", "v2 text")])]
+    for v, ident in zip(versions, ("id-1", "id-2")):
+        v.id = ident
+    check("find_version matches an already-published version", hub.find_version(versions, "v2 text") == "id-2")
+    check("find_version ignores whitespace drift", hub.find_version(versions, "  v1 text\n") == "id-1")
+    check("find_version returns '' for new text", hub.find_version(versions, "v3 text") == "")
+
+    # Everything after the text comparison -- the probe, the hedge check, the
+    # "this behaviour came from Prompt Hub" conclusion -- is a claim about the
+    # version just promoted. If the hub served a different one, continuing
+    # attributes that version's behaviour to this one and still reports success.
+    from pathlib import Path
+
+    source = (Path(__file__).with_name("09_prompt_hub.py")).read_text(encoding="utf-8")
+    mismatch = source.split("if published.strip() != expected.strip():")[1].split(
+        "matches the promoted version"
+    )[0]
+    check(
+        "a prompt-text mismatch aborts rather than warning and continuing",
+        "raise typer.Exit(1)" in mismatch,
+        mismatch.strip()[:120],
+    )
+
+
+def check_monitor_metrics() -> None:
+    """A monitor on a metric that never arrives is green forever and pages nobody."""
+    console.print("\n[bold]Monitor metric resolution[/bold]")
+    from importlib import import_module
+
+    mon = import_module("10_monitors")
+
+    available = ["eval.Groundedness.score", "eval.conciseness.score"]
+    metric, note = mon.resolve_metric("eval.groundedness.score", available)
+    check("a case-mismatched eval column is repointed", metric == "eval.Groundedness.score", metric)
+    check("...and the repoint is reported", bool(note), note)
+
+    metric, note = mon.resolve_metric("eval.conciseness.score", available)
+    check("an exact match is used", metric == "eval.conciseness.score")
+    check("...but batch-only columns are called out as going blind", "age out" in note, note)
+
+    metric, note = mon.resolve_metric("eval.missing.score", available)
+    check("a metric with no data is flagged", "cannot fire" in note, note)
+
+    metric, note = mon.resolve_metric("latencyP95Ms", available)
+    check("non-eval metrics are left alone", metric == "latencyP95Ms" and not note)
+
+    # The real live case: step 04's batch writes eval.groundedness.score once,
+    # step 05's continuous evaluator keeps writing eval.Groundedness.score.
+    # Preferring the exact spelling picks the dead one, and the monitor stops
+    # seeing data as those spans age out of its window.
+    both = ["eval.groundedness.score", "eval.Groundedness.score"]
+    live = {"eval.Groundedness.score"}
+    metric, note = mon.resolve_metric("eval.groundedness.score", both, live)
+    check(
+        "an exact match loses to the continuously-written column",
+        metric == "eval.Groundedness.score",
+        metric,
+    )
+    check("...and the reason is given", "continuous" in note.lower(), note)
+
+    metric, note = mon.resolve_metric("eval.Groundedness.score", both, live)
+    check(
+        "already pointing at the continuous column is silent",
+        metric == "eval.Groundedness.score" and not note,
+        note,
+    )
+
+    metric, note = mon.resolve_metric("eval.escalation_appropriate.score", both, live)
+    check(
+        "an eval with no continuous writer at all is still flagged",
+        "cannot fire" in note,
+        note,
+    )
+
+    # Verified against the live schema by introspection. createPerformanceMonitor
+    # has no field for an eval column at all -- its metric is the classic-ML
+    # PerformanceMetric enum -- so an eval monitor has to be a data-quality one.
+    check(
+        "eval monitors use the data-quality mutation, not the performance one",
+        "createDataQualityMonitor" in mon.CREATE_MONITOR
+        and "createPerformanceMonitor" not in mon.CREATE_MONITOR,
+    )
+    inputs = mon.monitor_inputs("space-1", "proj")
+    required = {"name", "operator", "dimensionName", "dimensionCategory", "dataQualityMetric"}
+    check(
+        "every monitor carries the fields the input type requires",
+        all(required <= set(m) for m in inputs),
+        str([sorted(required - set(m)) for m in inputs]),
+    )
+    check(
+        "eval dimensions are the full column name and categorised llmEval",
+        all(
+            m["dimensionName"].startswith("eval.") and m["dimensionCategory"] == "llmEval"
+            for m in inputs
+            if m["dimensionName"].startswith("eval.")
+        ),
+    )
+    check(
+        "latency is a span property named latency_ms, not a performance metric",
+        any(
+            m["dimensionName"] == "latency_ms" and m["dimensionCategory"] == "spanProperty"
+            for m in inputs
+        ),
+    )
+    check(
+        "monitors are scoped to the tracing environment",
+        all(m["modelEnvironmentName"] == "tracing" for m in inputs),
+    )
+
+    class Cfg:
+        arize_region = "eu-west-1a"
+
+    check(
+        "the GraphQL endpoint follows the space's region",
+        mon.graphql_url(Cfg()) == "https://app.eu-west-1a.arize.com/graphql",
+        mon.graphql_url(Cfg()),
+    )
+
+    class NoRegion:
+        arize_region = None
+
+    check(
+        "and falls back to the default host when unset",
+        mon.graphql_url(NoRegion()) == "https://app.arize.com/graphql",
+    )
+
+
 def check_retrieval_accumulates() -> None:
     """A turn may search twice; the record must cover both, not just the last."""
     console.print("\n[bold]Retrieval accumulation[/bold]")
@@ -545,6 +721,8 @@ def main() -> None:
     check_retrieval_accumulates()
     check_experiment_statistics()
     check_judge_verdict_parsing()
+    check_prompt_hub_plumbing()
+    check_monitor_metrics()
     check_prompts_and_tools()
     check_dataframe_contracts()
     check_targets_ax_not_phoenix()

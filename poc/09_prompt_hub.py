@@ -34,6 +34,37 @@ def version_id(obj) -> str:
     return str(getattr(version, "id", "")) if version else ""
 
 
+def list_versions(client, prompt_name: str, space: str) -> list:
+    """Every published version, newest first, or [] if the prompt is new.
+
+    The prompt name is a parameter rather than read from the module: it is
+    imported inside main(), so a global reference here raises NameError, and the
+    except below would report that as "no versions yet" and quietly republish
+    everything. The reason is printed for the same reason.
+    """
+    try:
+        response = client.prompts.list_versions(prompt=prompt_name, space=space)
+    except Exception as exc:  # noqa: BLE001 - expected on the very first run
+        console.print(f"  [dim]no existing versions ({type(exc).__name__}: {exc})[/dim]")
+        return []
+    return list(getattr(response, "data", None) or getattr(response, "prompt_versions", []))
+
+
+def find_version(versions: list, text: str) -> str:
+    """Id of an existing version whose system prompt is already `text`.
+
+    Prompt versions are immutable, and `create_version` never deduplicates, so
+    without this check each re-run of this script publishes another byte-identical
+    copy -- the history fills with noise and a real diff becomes hard to find.
+    """
+    from copilot.prompts import system_text
+
+    for version in versions:
+        if system_text(version).strip() == text.strip():
+            return str(getattr(version, "id", ""))
+    return ""
+
+
 @app.command()
 def main(
     promote: str = typer.Option("v2", help="Which local version to label `production`"),
@@ -61,41 +92,61 @@ def main(
     def message(text: str) -> LLMMessage:
         return LLMMessage(role=MessageRole.SYSTEM, content=text)
 
+    published = list_versions(client, PROMPT_NAME, space)
+
     # ---- v1: create the prompt -------------------------------------------
     console.print("[bold]Publishing v1[/bold] (the flawed baseline)")
-    try:
-        v1 = client.prompts.create(
-            space=space,
-            name=PROMPT_NAME,
-            commit_message="v1 baseline: helpful, but ungrounded and never escalates",
-            description="System prompt for the Nimbus support copilot.",
-            input_variable_format=InputVariableFormat.NONE,
-            provider=PROVIDER,
-            model=MODEL,
-            messages=[message(V1)],
-        )
-        v1_id = version_id(v1)
-        console.print(f"  created [bold]{PROMPT_NAME}[/bold] v1 (version {v1_id})")
-    except Exception as exc:  # noqa: BLE001 - re-runs: prompt already exists
-        console.print(f"  [yellow]exists already ({exc}); continuing[/yellow]")
-        v1_id = version_id(client.prompts.get(prompt=PROMPT_NAME, space=space))
+    v1_id = find_version(published, V1)
+    if v1_id:
+        console.print(f"  [dim]already published as {v1_id}; reusing[/dim]")
+    else:
+        try:
+            v1 = client.prompts.create(
+                space=space,
+                name=PROMPT_NAME,
+                commit_message="v1 baseline: helpful, but ungrounded and never escalates",
+                description="System prompt for the Nimbus support copilot.",
+                input_variable_format=InputVariableFormat.NONE,
+                provider=PROVIDER,
+                model=MODEL,
+                messages=[message(V1)],
+            )
+            v1_id = version_id(v1)
+            console.print(f"  created [bold]{PROMPT_NAME}[/bold] v1 (version {v1_id})")
+        except Exception as exc:  # noqa: BLE001 - prompt exists with other content
+            console.print(f"  [yellow]could not create ({exc}); adding as a version[/yellow]")
+            v1_id = version_id(
+                client.prompts.create_version(
+                    prompt=PROMPT_NAME,
+                    space=space,
+                    commit_message="v1 baseline: ungrounded and never escalates",
+                    input_variable_format=InputVariableFormat.NONE,
+                    provider=PROVIDER,
+                    model=MODEL,
+                    messages=[message(V1)],
+                )
+            )
 
     # ---- v2: new immutable version ---------------------------------------
     console.print("\n[bold]Publishing v2[/bold] (grounded, escalates, concise)")
-    v2 = client.prompts.create_version(
-        prompt=PROMPT_NAME,
-        space=space,
-        commit_message=(
-            "v2: require grounding in retrieved docs, admit gaps, escalate when "
-            "blocked, cap length. Beats v1 on the copilot-failures dataset."
-        ),
-        input_variable_format=InputVariableFormat.NONE,
-        provider=PROVIDER,
-        model=MODEL,
-        messages=[message(V2)],
-    )
-    v2_id = version_id(v2)
-    console.print(f"  created version [bold]{v2_id}[/bold]")
+    v2_id = find_version(published, V2)
+    if v2_id:
+        console.print(f"  [dim]already published as {v2_id}; reusing[/dim]")
+    else:
+        v2 = client.prompts.create_version(
+            prompt=PROMPT_NAME,
+            space=space,
+            commit_message=(
+                "v2: require grounding in retrieved docs, admit gaps, escalate when "
+                "blocked, cap length. Not yet proven better -- see poc/08."
+            ),
+            input_variable_format=InputVariableFormat.NONE,
+            provider=PROVIDER,
+            model=MODEL,
+            messages=[message(V2)],
+        )
+        v2_id = version_id(v2)
+        console.print(f"  created version [bold]{v2_id}[/bold]")
 
     # ---- label -----------------------------------------------------------
     target = v2_id if promote == "v2" else v1_id
@@ -124,8 +175,29 @@ def main(
         from copilot.prompts import load_prompt
         from copilot.tracing import flush, init_tracing
 
-        published = load_prompt("hub", settings=settings)
+        # strict: a silent fall back to the local copy would print a success
+        # here and then run the agent on a prompt that never came from Arize,
+        # which is the one thing this step is supposed to prove.
+        published = load_prompt("hub", settings=settings, strict=True)
+        expected = V2 if promote == "v2" else V1
         console.print(f"  fetched {len(published)} chars from Prompt Hub")
+        if published.strip() != expected.strip():
+            # Stop. Everything downstream -- the probe, the hedge check, the
+            # "that behaviour came from Prompt Hub" conclusion -- is a statement
+            # about the version we just promoted. Running it against some other
+            # version (a concurrently moved label, or one that hasn't propagated)
+            # would attribute that version's behaviour to this one and still
+            # report a successful promotion. A verification step that continues
+            # past a failed verification is not one.
+            console.print(
+                f"[bold red]`{PRODUCTION}` does not serve local {promote}.[/bold red] "
+                f"Fetched {len(published)} chars, expected {len(expected.strip())}.\n"
+                "Something else moved the label, or the update has not propagated. "
+                "Re-run to re-promote, or check Prompt Hub before trusting any "
+                "result below.\n"
+            )
+            raise typer.Exit(1)
+        console.print("  [green]matches the promoted version[/green]")
 
         init_tracing(settings)
         probe = "If I cancel mid-month, do I get a prorated refund for the unused days?"
@@ -150,9 +222,20 @@ def main(
                 "no code changed between v1 and now.\n"
             )
         else:
+            # The load is already proven above (strict fetch + text match), so
+            # this is not a plumbing problem: the published prompt reached the
+            # agent and the agent hallucinated anyway. The KB documents that
+            # cancellation stops future charges and says nothing about
+            # proration, so any "no, there are no prorated refunds" is inferred
+            # from an adjacent policy -- the exact move v2's grounding section
+            # forbids. Consistent with poc/08, where groundedness did not
+            # improve under v2.
             console.print(
-                "[yellow]The agent still answered confidently.[/yellow] Check that "
-                f"`{PRODUCTION}` points at the v2 version above.\n"
+                "[yellow]The agent answered confidently anyway.[/yellow] The prompt did "
+                f"load from Prompt Hub (verified above), so `{PRODUCTION}` is not the "
+                "problem — the wording is. The docs cover cancellation but not "
+                "proration, so this answer infers a refund policy from an adjacent "
+                "one.\n"
             )
 
     look_at(
