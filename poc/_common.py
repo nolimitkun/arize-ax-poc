@@ -46,13 +46,9 @@ def arize_client(settings: Settings):
     fixing only the latter leaves every span export and dataset call hitting
     the default region with a key that isn't valid there.
     """
-    from arize.client import ArizeClient
+    from copilot.config import platform_client
 
-    if settings.arize_region:
-        from arize.regions import Region
-
-        return ArizeClient(api_key=settings.arize_api_key, region=Region(settings.arize_region))
-    return ArizeClient(api_key=settings.arize_api_key)
+    return platform_client(settings)
 
 
 def window(hours: int = 24) -> tuple[datetime, datetime]:

@@ -124,6 +124,23 @@ def load_settings() -> Settings:
     )
 
 
+def platform_client(settings: Settings):
+    """The Arize platform client, region-matched to the space.
+
+    One definition, because getting it wrong is quiet: keys are region-scoped
+    and a cross-region call fails authorization rather than redirecting. A
+    caller that builds `ArizeClient(api_key=...)` directly works fine in the
+    default region and fails everywhere else.
+    """
+    from arize.client import ArizeClient
+
+    if settings.arize_region:
+        from arize.regions import Region
+
+        return ArizeClient(api_key=settings.arize_api_key, region=Region(settings.arize_region))
+    return ArizeClient(api_key=settings.arize_api_key)
+
+
 def settings_or_exit() -> Settings:
     """Entry point for CLI scripts: print the fix and exit 1 rather than traceback."""
     try:

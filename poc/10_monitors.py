@@ -25,7 +25,20 @@ from _common import arize_client, console, done, header, look_at, table, window
 
 app = typer.Typer(add_completion=False)
 
-GRAPHQL_URL = os.getenv("ARIZE_GRAPHQL_URL", "https://app.arize.com/graphql")
+def graphql_url(settings) -> str:
+    """The GraphQL endpoint for this space's region.
+
+    Same trap as the collector endpoint and the platform client: keys are
+    region-scoped, so an EU space driven against app.arize.com authenticates
+    against the wrong tenant rather than redirecting. The SDK's own host
+    convention is `<service>.<region>.arize.com`, and the app host follows it.
+    """
+    override = os.getenv("ARIZE_GRAPHQL_URL")
+    if override:
+        return override
+    region = getattr(settings, "arize_region", None)
+    host = f"app.{region}.arize.com" if region else "app.arize.com"
+    return f"https://{host}/graphql"
 
 CREATE_MONITOR = """
 mutation CreateEvalMonitor($input: CreatePerformanceMonitorMutationInput!) {
@@ -66,11 +79,28 @@ def monitor_inputs(project_name: str) -> list[dict]:
     ]
 
 
-def post_graphql(api_key: str, query: str, variables: dict) -> dict:
+def resolve_metric(metric: str, available: list[str]) -> tuple[str, str]:
+    """Point a monitor at the column the evals are actually logged under.
+
+    Eval columns carry the evaluator's name verbatim, so an evaluator created
+    in the UI as `Groundedness` logs `eval.Groundedness.score` while poc/04's
+    logs `eval.groundedness.score`. A monitor on the wrong casing is the worst
+    kind of broken: it is created successfully, shows green forever, and pages
+    nobody -- so the mismatch is repaired here and reported.
+    """
+    if not metric.startswith("eval.") or not available or metric in available:
+        return metric, ""
+    actual = {c.lower(): c for c in available}.get(metric.lower())
+    if actual:
+        return actual, f"logged as `{actual}` — monitor repointed"
+    return metric, "no data in this window; the monitor cannot fire until this eval runs"
+
+
+def post_graphql(url: str, api_key: str, query: str, variables: dict) -> dict:
     import httpx
 
     response = httpx.post(
-        GRAPHQL_URL,
+        url,
         headers={"x-api-key": api_key, "Content-Type": "application/json"},
         json={"query": query, "variables": variables},
         timeout=30.0,
@@ -112,6 +142,20 @@ def main(
                 for c in eval_cols
             ],
         )
+        # Eval columns are keyed by the evaluator's name verbatim, so an online
+        # evaluator named `Groundedness` in the UI and poc/04's `groundedness`
+        # are two unrelated metrics that look like one. A monitor can only watch
+        # one of them, and the other regresses unwatched.
+        by_case: dict[str, list[str]] = {}
+        for column in eval_cols:
+            by_case.setdefault(column.lower(), []).append(column)
+        for variants in by_case.values():
+            if len(variants) > 1:
+                console.print(
+                    f"  [yellow]{' and '.join(variants)} differ only in case and are "
+                    "separate metrics.[/yellow] A monitor on one ignores the other — "
+                    "rename the evaluator in Arize so they merge.\n"
+                )
     else:
         console.print(
             "[yellow]No eval score columns found.[/yellow] Run poc/04 (and give "
@@ -120,6 +164,11 @@ def main(
 
     # ---- 2. Monitors ------------------------------------------------------
     monitors = monitor_inputs(settings.arize_project_name)
+    notes = []
+    for m in monitors:
+        m["evaluationMetric"], note = resolve_metric(m["evaluationMetric"], eval_cols)
+        if note:
+            notes.append(f"{m['name']}: {note}")
     table(
         "Monitors to create",
         ["name", "metric", "condition", "why"],
@@ -128,14 +177,17 @@ def main(
             for m in monitors
         ],
     )
+    for note in notes:
+        console.print(f"  [yellow]{note}[/yellow]")
 
+    url = graphql_url(settings)
     graphql_key = os.getenv("ARIZE_GRAPHQL_API_KEY")
     if apply and graphql_key:
-        console.print("\nCreating monitors via GraphQL…")
+        console.print(f"\nCreating monitors via GraphQL ({url})…")
         for m in monitors:
             payload = {k: v for k, v in m.items() if k != "why"}
             try:
-                result = post_graphql(graphql_key, CREATE_MONITOR, {"input": payload})
+                result = post_graphql(url, graphql_key, CREATE_MONITOR, {"input": payload})
                 if result.get("errors"):
                     console.print(f"  [red]{m['name']}: {result['errors'][0].get('message')}[/red]")
                 else:
@@ -147,6 +199,7 @@ def main(
             "\n[dim]Not applied. Monitors need a GraphQL-capable key:\n"
             "  export ARIZE_GRAPHQL_API_KEY=...   # Arize → Settings → API Keys (GraphQL)\n"
             "  uv run python poc/10_monitors.py --apply\n"
+            f"Endpoint for this region: {url}\n"
             "Mutation shape:[/dim]"
         )
         console.print(f"[dim]{CREATE_MONITOR.strip()}[/dim]")
