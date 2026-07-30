@@ -181,10 +181,22 @@ the `copilot-failures` dataset in Playground, edit the system prompt against
 those exact inputs, and watch the answers change side by side. Step 08 is the
 automated version of the same idea.
 
-**Step 10 needs a GraphQL key.** Monitors and dashboards aren't in the Python
-SDK — they're behind the GraphQL API. The script prints the exact mutation and
-applies it with `--apply` if `ARIZE_GRAPHQL_API_KEY` is set. The endpoint is
-region-derived, like every other host here.
+**Step 10 uses GraphQL, and writes are enterprise-only.** Monitors and dashboards
+aren't in the Python SDK. `ARIZE_API_KEY` authenticates against GraphQL with the
+`x-api-key` header, so no separate key is needed (`ARIZE_GRAPHQL_API_KEY` still
+wins if set), and the endpoint is region-derived like every other host here.
+Reads work on any plan — that is how the script's dimension names were verified
+against the live schema — but `--apply` returns *"GraphQL Mutation access is only
+available for enterprise accounts"*. The script prints the exact settings and
+degrades to a "create these by hand" message; the monitor configuration is
+identical either way.
+
+An eval score is a **dimension**, not a performance metric: `PerformanceMetric`
+is the classic-ML enum (`accuracy`, `auc`, `rmse`, …) and
+`CreatePerformanceMonitorMutationInput` has no field for an eval column at all.
+Eval monitors are therefore `createDataQualityMonitor` with
+`dimensionCategory: llmEval`, `dimensionName: "eval.<name>.score"` and an
+aggregation (`avg`). Latency is `latency_ms` under `spanProperty` with `p95`.
 
 ---
 

@@ -40,38 +40,60 @@ def graphql_url(settings) -> str:
     host = f"app.{region}.arize.com" if region else "app.arize.com"
     return f"https://{host}/graphql"
 
+# An eval score is a *dimension* on the tracing model, not a performance metric.
+# `createPerformanceMonitor` only accepts the classic-ML PerformanceMetric enum
+# (accuracy, auc, rmse, ...) and has no field for an eval column at all, so it
+# cannot express "watch eval.groundedness.score". Data-quality monitors take an
+# arbitrary dimension plus an aggregation, which is what these are.
 CREATE_MONITOR = """
-mutation CreateEvalMonitor($input: CreatePerformanceMonitorMutationInput!) {
-  createPerformanceMonitor(input: $input) {
-    monitor { id name threshold notificationEmails }
+mutation CreateEvalMonitor($input: CreateDataQualityMonitorMutationInput!) {
+  createDataQualityMonitor(input: $input) {
+    monitor { id name threshold }
   }
 }
 """
 
+# Dimension names come from the model's tracing schema, verified by
+# introspection against the live space. Eval dimensions are the full column
+# name (`eval.<name>.score`), while latency is a built-in span property named
+# `latency_ms` -- not `latencyMs`, and not a performance metric.
+LATENCY_DIMENSION = "latency_ms"
 
-def monitor_inputs(project_name: str) -> list[dict]:
+
+def monitor_inputs(space_id: str, project_name: str) -> list[dict]:
     """The three monitors worth having on this agent."""
+    common = {
+        "spaceId": space_id,
+        "modelName": project_name,
+        "modelEnvironmentName": "tracing",
+    }
     return [
         {
+            **common,
             "name": "Groundedness drop",
-            "modelName": project_name,
-            "evaluationMetric": "eval.groundedness.score",
+            "dimensionName": "eval.groundedness.score",
+            "dimensionCategory": "llmEval",
+            "dataQualityMetric": "avg",
             "operator": "lessThan",
             "threshold": 0.9,
             "why": "Hallucination regressions -- the failure that started this loop.",
         },
         {
+            **common,
             "name": "Escalation misses",
-            "modelName": project_name,
-            "evaluationMetric": "eval.escalation_appropriate.score",
+            "dimensionName": "eval.escalation_appropriate.score",
+            "dimensionCategory": "llmEval",
+            "dataQualityMetric": "avg",
             "operator": "lessThan",
             "threshold": 0.95,
             "why": "Blocked users silently not reaching a human.",
         },
         {
+            **common,
             "name": "Turn latency p95",
-            "modelName": project_name,
-            "evaluationMetric": "latencyP95Ms",
+            "dimensionName": LATENCY_DIMENSION,
+            "dimensionCategory": "spanProperty",
+            "dataQualityMetric": "p95",
             "operator": "greaterThan",
             "threshold": 20000,
             "why": "Agent loops that stall behind slow tool calls.",
@@ -112,7 +134,7 @@ def post_graphql(url: str, api_key: str, query: str, variables: dict) -> dict:
 @app.command()
 def main(
     apply: bool = typer.Option(
-        False, help="Actually POST the mutations (needs ARIZE_GRAPHQL_API_KEY)"
+        False, help="Actually POST the mutations (uses ARIZE_API_KEY)"
     ),
     hours: int = typer.Option(24, help="Window used to confirm eval metrics exist"),
 ) -> None:
@@ -163,17 +185,22 @@ def main(
         )
 
     # ---- 2. Monitors ------------------------------------------------------
-    monitors = monitor_inputs(settings.arize_project_name)
+    monitors = monitor_inputs(settings.arize_space_id, settings.arize_project_name)
     notes = []
     for m in monitors:
-        m["evaluationMetric"], note = resolve_metric(m["evaluationMetric"], eval_cols)
+        m["dimensionName"], note = resolve_metric(m["dimensionName"], eval_cols)
         if note:
             notes.append(f"{m['name']}: {note}")
     table(
         "Monitors to create",
-        ["name", "metric", "condition", "why"],
+        ["name", "dimension", "condition", "why"],
         [
-            [m["name"], m["evaluationMetric"], f"{m['operator']} {m['threshold']}", m["why"]]
+            [
+                m["name"],
+                m["dimensionName"],
+                f"{m['dataQualityMetric']} {m['operator']} {m['threshold']}",
+                m["why"],
+            ]
             for m in monitors
         ],
     )
@@ -181,24 +208,44 @@ def main(
         console.print(f"  [yellow]{note}[/yellow]")
 
     url = graphql_url(settings)
-    graphql_key = os.getenv("ARIZE_GRAPHQL_API_KEY")
+    # The space API key works against GraphQL with the x-api-key header, so a
+    # separate key is optional rather than required.
+    graphql_key = os.getenv("ARIZE_GRAPHQL_API_KEY") or settings.arize_api_key
     if apply and graphql_key:
         console.print(f"\nCreating monitors via GraphQL ({url})…")
+        gated = False
         for m in monitors:
             payload = {k: v for k, v in m.items() if k != "why"}
             try:
                 result = post_graphql(url, graphql_key, CREATE_MONITOR, {"input": payload})
-                if result.get("errors"):
-                    console.print(f"  [red]{m['name']}: {result['errors'][0].get('message')}[/red]")
+                error = (result.get("errors") or [{}])[0].get("message", "")
+                if "enterprise" in error.lower():
+                    # Reads and introspection are allowed on every plan; only
+                    # mutations are gated. Say that once rather than three times.
+                    gated = True
+                    break
+                if error:
+                    console.print(f"  [red]{m['name']}: {error}[/red]")
                 else:
                     console.print(f"  [green]created[/green] {m['name']}")
             except Exception as exc:  # noqa: BLE001
                 console.print(f"  [red]{m['name']}: {exc}[/red]")
+        if gated:
+            console.print(
+                "  [yellow]GraphQL mutations are enterprise-only on this account.[/yellow]\n"
+                "  Reads work (that is how the dimension names above were verified), "
+                "writes do not.\n"
+                "  Create these by hand — [bold]Monitors → New Monitor → Data "
+                "Quality[/bold] — using the\n"
+                "  dimension, aggregation, operator and threshold in the table. The "
+                "settings are\n"
+                "  identical; only the transport differs.\n"
+            )
     else:
         console.print(
-            "\n[dim]Not applied. Monitors need a GraphQL-capable key:\n"
-            "  export ARIZE_GRAPHQL_API_KEY=...   # Arize → Settings → API Keys (GraphQL)\n"
+            "\n[dim]Not applied. Re-run with --apply to create these:\n"
             "  uv run python poc/10_monitors.py --apply\n"
+            "ARIZE_API_KEY is used unless ARIZE_GRAPHQL_API_KEY is set.\n"
             f"Endpoint for this region: {url}\n"
             "Mutation shape:[/dim]"
         )

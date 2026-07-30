@@ -369,6 +369,41 @@ def check_monitor_metrics() -> None:
     metric, note = mon.resolve_metric("latencyP95Ms", available)
     check("non-eval metrics are left alone", metric == "latencyP95Ms" and not note)
 
+    # Verified against the live schema by introspection. createPerformanceMonitor
+    # has no field for an eval column at all -- its metric is the classic-ML
+    # PerformanceMetric enum -- so an eval monitor has to be a data-quality one.
+    check(
+        "eval monitors use the data-quality mutation, not the performance one",
+        "createDataQualityMonitor" in mon.CREATE_MONITOR
+        and "createPerformanceMonitor" not in mon.CREATE_MONITOR,
+    )
+    inputs = mon.monitor_inputs("space-1", "proj")
+    required = {"name", "operator", "dimensionName", "dimensionCategory", "dataQualityMetric"}
+    check(
+        "every monitor carries the fields the input type requires",
+        all(required <= set(m) for m in inputs),
+        str([sorted(required - set(m)) for m in inputs]),
+    )
+    check(
+        "eval dimensions are the full column name and categorised llmEval",
+        all(
+            m["dimensionName"].startswith("eval.") and m["dimensionCategory"] == "llmEval"
+            for m in inputs
+            if m["dimensionName"].startswith("eval.")
+        ),
+    )
+    check(
+        "latency is a span property named latency_ms, not a performance metric",
+        any(
+            m["dimensionName"] == "latency_ms" and m["dimensionCategory"] == "spanProperty"
+            for m in inputs
+        ),
+    )
+    check(
+        "monitors are scoped to the tracing environment",
+        all(m["modelEnvironmentName"] == "tracing" for m in inputs),
+    )
+
     class Cfg:
         arize_region = "eu-west-1a"
 

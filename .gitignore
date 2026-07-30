@@ -1,4 +1,8 @@
 .env
+# Editor swap files: .env.swp holds whatever .env does, secrets included.
+*.swp
+*.swo
+*~
 .venv/
 __pycache__/
 *.pyc
