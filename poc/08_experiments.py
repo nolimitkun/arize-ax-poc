@@ -312,7 +312,7 @@ def main(
     # and only counted when the disagreement is unlikely under chance.
     base, cand = summaries.get(baseline, {}), summaries.get(candidate, {})
     base_df, cand_df = frames.get(baseline), frames.get(candidate)
-    rows, improved, regressed, inconclusive = [], 0, 0, 0
+    rows, improved, regressed, inconclusive, unpaired = [], 0, 0, 0, 0
 
     for name in sorted(set(base) | set(cand)):
         b, c = base.get(name), cand.get(name)
@@ -329,17 +329,24 @@ def main(
         )
 
         if paired is None:
-            # No pairing available: fall back to magnitude and say so.
-            evidence = "[dim]unpaired[/dim]"
-            significant = abs(delta) >= 0.10
+            # The results frame carried no example-key column, so the rows
+            # can't be matched up and there is no valid test to run. Falling
+            # back to "is the delta big enough" would be worse than saying
+            # nothing: magnitude alone carries no information about sample size
+            # or how many rows moved, so a 0.10 delta on 5 rows would be
+            # announced as a win -- the exact false positive this whole section
+            # exists to prevent. Report it as untestable instead.
+            evidence = "[yellow]unpaired — untestable[/yellow]"
+            significant = False
+            unpaired += 1
         else:
             only_base, only_cand, p = paired
             evidence = f"{only_cand}↑ {only_base}↓  p={p:.3f}"
             significant = p < 0.05
+            if p >= 0.05 and abs(delta) > 0.005:
+                inconclusive += 1
 
         if not significant:
-            if abs(delta) > 0.005:
-                inconclusive += 1
             arrow = f"[dim]{delta:+.2f} ≈[/dim]"
         elif delta > 0:
             improved += 1
@@ -362,12 +369,18 @@ def main(
     )
 
     console.print()
-    trailer = (
-        f" {inconclusive} moved but not significantly — more rows would be needed "
-        "to call those."
-        if inconclusive
-        else ""
-    )
+    notes = []
+    if inconclusive:
+        notes.append(
+            f"{inconclusive} moved but not significantly — more rows would be needed "
+            "to call those."
+        )
+    if unpaired:
+        notes.append(
+            f"{unpaired} could not be paired row-by-row, so no test was run on them "
+            "— they are counted neither way."
+        )
+    trailer = (" " + " ".join(notes)) if notes else ""
     if improved and not regressed:
         console.print(
             f"[bold green]{candidate} wins.[/bold green] {improved} evaluator(s) improved "

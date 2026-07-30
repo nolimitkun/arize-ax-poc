@@ -17,6 +17,8 @@ at a time.
 
 from __future__ import annotations
 
+import re
+
 import openai
 
 from .config import THINKING_OFF, Settings
@@ -68,6 +70,39 @@ _INSTRUCTION = (
     "`hallucinated` -- then one short sentence of justification on the next line."
 )
 
+# Words a judge sometimes prefixes its verdict with. Dropped before looking for
+# the label so `Verdict: grounded` still parses.
+_FILLER = frozenset({"verdict", "label", "answer", "assessment", "the", "is", "a", "it"})
+
+
+def parse_verdict(text: str) -> tuple[str, float, str]:
+    """Map raw judge text to (label, score, explanation).
+
+    Exact token, never substring. `ungrounded` *contains* `grounded`, so a
+    substring test scores a hallucination as a pass -- and a judge that
+    volunteers that word is exactly the case worth catching, not silently
+    passing.
+
+    Anything that isn't one of the two labels returns `error` and a NaN score
+    rather than defaulting. A default would inflate both variants of an
+    experiment by the same amount, which hides itself: the means move together,
+    the delta looks clean, and nothing signals that a fraction of the rows were
+    never actually graded. NaN instead drops the row from the mean and out of
+    the paired test, so the sample size falls visibly.
+    """
+    lines = [line for line in text.strip().splitlines() if line.strip()]
+    first = lines[0].lower() if lines else ""
+    tokens = [t for t in re.findall(r"[a-z]+", first) if t not in _FILLER]
+    label = tokens[0] if tokens else ""
+    if label not in CHOICES:
+        return (
+            "error",
+            float("nan"),
+            f"Unparseable judge verdict: {text.strip()[:200]!r}",
+        )
+    explanation = " ".join(line.strip() for line in lines[1:]).strip() or first
+    return label, CHOICES[label], explanation
+
 
 def judge_groundedness(
     question: str,
@@ -108,17 +143,4 @@ def judge_groundedness(
     except Exception as exc:  # noqa: BLE001 - one bad row shouldn't void the run
         return "error", float("nan"), f"Judge call failed: {type(exc).__name__}: {exc}"
 
-    text = (response.choices[0].message.content or "").strip()
-    lowered = text.lower()
-    # Check hallucinated first: "not hallucinated" is not a label the judge is
-    # asked for, and a bare substring test for "grounded" would match
-    # "ungrounded" too.
-    if "hallucinated" in lowered.split("\n")[0]:
-        label = "hallucinated"
-    elif "grounded" in lowered.split("\n")[0]:
-        label = "grounded"
-    else:
-        label = "hallucinated" if "hallucinated" in lowered else "grounded"
-
-    explanation = " ".join(text.split("\n")[1:]).strip() or text
-    return label, CHOICES[label], explanation
+    return parse_verdict(response.choices[0].message.content or "")
