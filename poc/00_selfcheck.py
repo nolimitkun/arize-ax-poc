@@ -207,6 +207,90 @@ def check_code_evaluators() -> None:
     )
 
 
+def check_experiment_statistics() -> None:
+    """The verdict in poc/08 rests on these, so they get pinned down."""
+    console.print("\n[bold]Experiment significance[/bold]")
+    from importlib import import_module
+
+    exp = import_module("08_experiments")
+
+    check("no disagreement -> p=1", exp.mcnemar_p(0, 0) == 1.0)
+    check(
+        "1 vs 0 is not significant (the noise case that mis-declared a win)",
+        exp.mcnemar_p(0, 1) > 0.05,
+        f"p={exp.mcnemar_p(0, 1):.3f}",
+    )
+    check(
+        "6 vs 0 is significant",
+        exp.mcnemar_p(0, 6) < 0.05,
+        f"p={exp.mcnemar_p(0, 6):.3f}",
+    )
+    check("symmetric in its arguments", exp.mcnemar_p(0, 6) == exp.mcnemar_p(6, 0))
+    check(
+        "an even split is never significant",
+        exp.mcnemar_p(5, 5) == 1.0,
+        f"p={exp.mcnemar_p(5, 5):.3f}",
+    )
+    # Exact two-sided binomial: 2 * P(X<=0) = 2 * (1/2)^6 = 0.03125
+    check(
+        "matches the exact binomial value",
+        abs(exp.mcnemar_p(0, 6) - 0.03125) < 1e-9,
+        f"got {exp.mcnemar_p(0, 6)}",
+    )
+
+    # Pairing: v2 fixes 4 rows, breaks 0 -> significant improvement.
+    base = pd.DataFrame({"example_id": list(range(6)), "eval.groundedness.score": [0, 0, 0, 0, 1, 1]})
+    cand = pd.DataFrame({"example_id": list(range(6)), "eval.groundedness.score": [1, 1, 1, 1, 1, 1]})
+    paired = exp.paired_verdict(base, cand, "groundedness")
+    check("paired verdict finds the fixed rows", paired is not None and paired[:2] == (0, 4), str(paired))
+    check("unpairable frames return None", exp.paired_verdict(
+        pd.DataFrame({"x": [1]}), pd.DataFrame({"x": [1]}), "groundedness") is None)
+    # An unpaired evaluator must not be called significant on the strength of a
+    # big delta -- magnitude alone says nothing about how many rows moved.
+    from pathlib import Path
+
+    source = (Path(__file__).with_name("08_experiments.py")).read_text(encoding="utf-8")
+    unpaired_branch = source.split("if paired is None:")[1].split("else:")[0]
+    check(
+        "unpaired results are never declared significant",
+        "significant = False" in unpaired_branch
+        and "abs(delta)" not in unpaired_branch,
+        unpaired_branch.strip()[:120],
+    )
+
+
+def check_judge_verdict_parsing() -> None:
+    """`ungrounded` must not read as `grounded` -- it inverts the verdict."""
+    console.print("\n[bold]Judge verdict parsing[/bold]")
+    import math
+
+    from copilot.evals import parse_verdict
+
+    for text, expected in [
+        ("grounded\nEvery claim is in the docs.", "grounded"),
+        ("hallucinated\nInvented a 30-day window.", "hallucinated"),
+        ("Verdict: grounded", "grounded"),
+        ("**hallucinated**", "hallucinated"),
+        ("GROUNDED.", "grounded"),
+        # The bug: substring matching scored these as passes.
+        ("ungrounded\nNo support for the refund claim.", "error"),
+        ("not hallucinated", "error"),
+        ("I cannot determine this.", "error"),
+        ("", "error"),
+    ]:
+        label, score, _ = parse_verdict(text)
+        check(
+            f"{(text.splitlines() or [''])[0][:34]!r:<38} -> {expected}",
+            label == expected,
+            f"got {label}",
+        )
+        if expected == "error":
+            check("  ...and scores NaN, so the row leaves the mean", math.isnan(score))
+
+    _, _, why = parse_verdict("maybe?")
+    check("unparseable output is quoted back for debugging", "maybe?" in why, why)
+
+
 def check_retrieval_accumulates() -> None:
     """A turn may search twice; the record must cover both, not just the last."""
     console.print("\n[bold]Retrieval accumulation[/bold]")
@@ -459,6 +543,8 @@ def main() -> None:
     check_questions()
     check_code_evaluators()
     check_retrieval_accumulates()
+    check_experiment_statistics()
+    check_judge_verdict_parsing()
     check_prompts_and_tools()
     check_dataframe_contracts()
     check_targets_ax_not_phoenix()
