@@ -19,6 +19,7 @@ Docs: https://arize.com/docs/ax/evaluate/human-review
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -29,7 +30,36 @@ from _common import arize_client, console, done, header, load, look_at, save, ta
 app = typer.Typer(add_completion=False)
 
 ANNOTATION_NAME = "human_groundedness"
-REVIEWER = "poc-reviewer@example.com"
+
+# Fallback only. A queue's annotators must be real users with access to the
+# space -- Arize 404s with "Annotator email not found or does not have access"
+# otherwise -- so the reviewer is resolved from the account at runtime and this
+# placeholder is what gets written into the annotation's `updated_by` when no
+# real user can be found.
+REVIEWER_FALLBACK = "poc-reviewer@example.com"
+
+
+def reviewer_email(client) -> str:
+    """A real annotator for this account: env override, else the first user.
+
+    Hardcoding an address would make the queue work for exactly one person, so
+    the common case (a single-seat account) resolves itself.
+    """
+    override = os.getenv("POC_REVIEWER_EMAIL")
+    if override:
+        return override
+    try:
+        response = client.users.list(limit=50)
+    except Exception as exc:  # noqa: BLE001 - keep going with the placeholder
+        console.print(f"  [dim]could not list users ({type(exc).__name__}: {exc})[/dim]")
+        return REVIEWER_FALLBACK
+    for _key, value in response:
+        if isinstance(value, list):
+            for user in value:
+                email = getattr(user, "email", "")
+                if email:
+                    return str(email)
+    return REVIEWER_FALLBACK
 
 
 def simulated_human_label(row: pd.Series) -> tuple[str, float, str]:
@@ -108,17 +138,25 @@ def main(
         config_id = str(getattr(match, "id", "")) if match else ""
 
     # ---- 2. Labelling queue ---------------------------------------------
+    reviewer = reviewer_email(client)
     if not skip_queue and config_id:
         start, end = window(48)
         try:
             project = client.projects.get(
                 project=settings.arize_project_name, space=settings.arize_space_name
             )
+            # The typed input rather than a plain dict, for two reasons: a
+            # dict goes through `AnnotationQueueRecordInput.from_dict`, which
+            # json.dumps it and dies on the datetimes ("Object of type datetime
+            # is not JSON serializable"); and `record_type` is an enum whose
+            # only accepted value is upper-case `SPAN`.
+            from arize.annotation_queues.types import AnnotationQueueSpanRecordInput
+
             queue = client.annotation_queues.create(
                 name="Groundedness review",
                 space=settings.arize_space_name,
                 annotation_config_ids=[config_id],
-                annotator_emails=[REVIEWER],
+                annotator_emails=[reviewer],
                 instructions=(
                     "Read the question and the assistant's answer. Mark 'hallucinated' "
                     "if the answer states any Nimbus policy, number or timeframe that "
@@ -126,13 +164,13 @@ def main(
                     "Declining to answer an undocumented question is 'grounded'."
                 ),
                 record_sources=[
-                    {
-                        "record_type": "span",
-                        "project_id": str(project.id),
-                        "start_time": start,
-                        "end_time": end,
-                        "span_ids": [str(s) for s in ranked["span_id"].tolist()],
-                    }
+                    AnnotationQueueSpanRecordInput(
+                        record_type="SPAN",
+                        project_id=str(project.id),
+                        start_time=start,
+                        end_time=end,
+                        span_ids=[str(s) for s in ranked["span_id"].tolist()],
+                    )
                 ],
             )
             console.print(
@@ -152,7 +190,7 @@ def main(
             f"annotation.{ANNOTATION_NAME}.label": labels[0].values,
             f"annotation.{ANNOTATION_NAME}.score": labels[1].astype(float).values,
             f"annotation.{ANNOTATION_NAME}.text": labels[2].values,
-            f"annotation.{ANNOTATION_NAME}.updated_by": REVIEWER,
+            f"annotation.{ANNOTATION_NAME}.updated_by": reviewer,
             f"annotation.{ANNOTATION_NAME}.updated_at": int(now.timestamp() * 1000),
         }
     )
