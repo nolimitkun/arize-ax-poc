@@ -347,6 +347,22 @@ def check_prompt_hub_plumbing() -> None:
     check("find_version ignores whitespace drift", hub.find_version(versions, "  v1 text\n") == "id-1")
     check("find_version returns '' for new text", hub.find_version(versions, "v3 text") == "")
 
+    # Everything after the text comparison -- the probe, the hedge check, the
+    # "this behaviour came from Prompt Hub" conclusion -- is a claim about the
+    # version just promoted. If the hub served a different one, continuing
+    # attributes that version's behaviour to this one and still reports success.
+    from pathlib import Path
+
+    source = (Path(__file__).with_name("09_prompt_hub.py")).read_text(encoding="utf-8")
+    mismatch = source.split("if published.strip() != expected.strip():")[1].split(
+        "matches the promoted version"
+    )[0]
+    check(
+        "a prompt-text mismatch aborts rather than warning and continuing",
+        "raise typer.Exit(1)" in mismatch,
+        mismatch.strip()[:120],
+    )
+
 
 def check_monitor_metrics() -> None:
     """A monitor on a metric that never arrives is green forever and pages nobody."""
@@ -361,13 +377,42 @@ def check_monitor_metrics() -> None:
     check("...and the repoint is reported", bool(note), note)
 
     metric, note = mon.resolve_metric("eval.conciseness.score", available)
-    check("an exact match is left alone and unremarked", metric == "eval.conciseness.score" and not note)
+    check("an exact match is used", metric == "eval.conciseness.score")
+    check("...but batch-only columns are called out as going blind", "age out" in note, note)
 
     metric, note = mon.resolve_metric("eval.missing.score", available)
     check("a metric with no data is flagged", "cannot fire" in note, note)
 
     metric, note = mon.resolve_metric("latencyP95Ms", available)
     check("non-eval metrics are left alone", metric == "latencyP95Ms" and not note)
+
+    # The real live case: step 04's batch writes eval.groundedness.score once,
+    # step 05's continuous evaluator keeps writing eval.Groundedness.score.
+    # Preferring the exact spelling picks the dead one, and the monitor stops
+    # seeing data as those spans age out of its window.
+    both = ["eval.groundedness.score", "eval.Groundedness.score"]
+    live = {"eval.Groundedness.score"}
+    metric, note = mon.resolve_metric("eval.groundedness.score", both, live)
+    check(
+        "an exact match loses to the continuously-written column",
+        metric == "eval.Groundedness.score",
+        metric,
+    )
+    check("...and the reason is given", "continuous" in note.lower(), note)
+
+    metric, note = mon.resolve_metric("eval.Groundedness.score", both, live)
+    check(
+        "already pointing at the continuous column is silent",
+        metric == "eval.Groundedness.score" and not note,
+        note,
+    )
+
+    metric, note = mon.resolve_metric("eval.escalation_appropriate.score", both, live)
+    check(
+        "an eval with no continuous writer at all is still flagged",
+        "cannot fire" in note,
+        note,
+    )
 
     # Verified against the live schema by introspection. createPerformanceMonitor
     # has no field for an eval column at all -- its metric is the classic-ML

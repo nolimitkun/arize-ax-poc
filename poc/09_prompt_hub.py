@@ -181,12 +181,23 @@ def main(
         published = load_prompt("hub", settings=settings, strict=True)
         expected = V2 if promote == "v2" else V1
         console.print(f"  fetched {len(published)} chars from Prompt Hub")
-        check = (
-            "[green]matches the promoted version[/green]"
-            if published.strip() == expected.strip()
-            else f"[yellow]differs from local {promote} — the hub copy is authoritative[/yellow]"
-        )
-        console.print(f"  {check}")
+        if published.strip() != expected.strip():
+            # Stop. Everything downstream -- the probe, the hedge check, the
+            # "that behaviour came from Prompt Hub" conclusion -- is a statement
+            # about the version we just promoted. Running it against some other
+            # version (a concurrently moved label, or one that hasn't propagated)
+            # would attribute that version's behaviour to this one and still
+            # report a successful promotion. A verification step that continues
+            # past a failed verification is not one.
+            console.print(
+                f"[bold red]`{PRODUCTION}` does not serve local {promote}.[/bold red] "
+                f"Fetched {len(published)} chars, expected {len(expected.strip())}.\n"
+                "Something else moved the label, or the update has not propagated. "
+                "Re-run to re-promote, or check Prompt Hub before trusting any "
+                "result below.\n"
+            )
+            raise typer.Exit(1)
+        console.print("  [green]matches the promoted version[/green]")
 
         init_tracing(settings)
         probe = "If I cancel mid-month, do I get a prorated refund for the unused days?"

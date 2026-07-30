@@ -101,20 +101,81 @@ def monitor_inputs(space_id: str, project_name: str) -> list[dict]:
     ]
 
 
-def resolve_metric(metric: str, available: list[str]) -> tuple[str, str]:
-    """Point a monitor at the column the evals are actually logged under.
+def continuous_eval_columns(client, space: str, project: str) -> set[str]:
+    """Eval columns that keep being written, as opposed to written once.
 
-    Eval columns carry the evaluator's name verbatim, so an evaluator created
-    in the UI as `Groundedness` logs `eval.Groundedness.score` while poc/04's
-    logs `eval.groundedness.score`. A monitor on the wrong casing is the worst
-    kind of broken: it is created successfully, shows green forever, and pages
-    nobody -- so the mismatch is repaired here and reported.
+    This is the distinction a monitor lives or dies on. poc/04 grades a batch of
+    historic spans and stops; poc/05 attaches a *continuous* evaluation task that
+    scores new traffic as it arrives. Both land in `eval.<name>.score`, and the
+    column tells you nothing about which is which -- so it is read back from the
+    tasks themselves: continuous tasks -> their evaluator ids -> those
+    evaluators' names.
     """
-    if not metric.startswith("eval.") or not available or metric in available:
+    try:
+        tasks = client.tasks.list(space=space, project=project)
+        evaluators = client.evaluators.list(space=space)
+    except Exception:  # noqa: BLE001 - listing is a nicety, not the point
+        return set()
+
+    def rows(response, *names):
+        for attr in names:
+            value = getattr(response, attr, None)
+            if value:
+                return list(value)
+        return []
+
+    names_by_id = {
+        str(getattr(e, "id", "")): getattr(e, "name", "")
+        for e in rows(evaluators, "data", "evaluators")
+    }
+    live: set[str] = set()
+    for task in rows(tasks, "data", "tasks"):
+        if not getattr(task, "is_continuous", False):
+            continue
+        for entry in getattr(task, "evaluators", None) or []:
+            ident = str(getattr(entry, "evaluator_id", None) or getattr(entry, "id", ""))
+            name = names_by_id.get(ident)
+            if name:
+                live.add(f"eval.{name}.score")
+    return live
+
+
+def resolve_metric(
+    metric: str, available: list[str], continuous: set[str] | None = None
+) -> tuple[str, str]:
+    """Point a monitor at the column that will still be written tomorrow.
+
+    Two ways to get this wrong, both of which produce a monitor that is created
+    successfully, shows green forever, and pages nobody:
+
+      * Wrong casing. Columns carry the evaluator's name verbatim, so poc/05's
+        `Groundedness` and poc/04's `groundedness` are unrelated metrics.
+      * Right casing, dead column. Preferring an exact spelling picks poc/04's
+        one-time batch over poc/05's continuous evaluator, and the monitor stops
+        seeing data as those historic spans age out of its window.
+
+    So a continuously-written column wins over an exact name match, and a metric
+    with no continuous writer at all is called out rather than quietly created.
+    """
+    if not metric.startswith("eval."):
         return metric, ""
-    actual = {c.lower(): c for c in available}.get(metric.lower())
-    if actual:
-        return actual, f"logged as `{actual}` — monitor repointed"
+
+    live = sorted(c for c in (continuous or set()) if c.lower() == metric.lower())
+    if live:
+        chosen = live[0]
+        if chosen == metric:
+            return chosen, ""
+        return chosen, f"repointed to `{chosen}`, the continuously-updated column"
+
+    same = sorted(c for c in available if c.lower() == metric.lower())
+    if same:
+        chosen = same[0]
+        note = (
+            f"`{chosen}` is written by a one-time batch (poc/04), not a continuous "
+            "evaluator — this monitor goes blind once those spans age out. Attach a "
+            "continuous task in poc/05 to monitor it for real."
+        )
+        return chosen, note
     return metric, "no data in this window; the monitor cannot fire until this eval runs"
 
 
@@ -175,8 +236,8 @@ def main(
             if len(variants) > 1:
                 console.print(
                     f"  [yellow]{' and '.join(variants)} differ only in case and are "
-                    "separate metrics.[/yellow] A monitor on one ignores the other — "
-                    "rename the evaluator in Arize so they merge.\n"
+                    "separate metrics.[/yellow] A monitor on one ignores the other; "
+                    "the continuously-scored one is picked below.\n"
                 )
     else:
         console.print(
@@ -186,9 +247,15 @@ def main(
 
     # ---- 2. Monitors ------------------------------------------------------
     monitors = monitor_inputs(settings.arize_space_id, settings.arize_project_name)
+    live = continuous_eval_columns(
+        client, settings.arize_space_name, settings.arize_project_name
+    )
+    console.print(
+        f"Continuously-scored eval columns: {', '.join(sorted(live)) or '[yellow]none[/yellow]'}\n"
+    )
     notes = []
     for m in monitors:
-        m["dimensionName"], note = resolve_metric(m["dimensionName"], eval_cols)
+        m["dimensionName"], note = resolve_metric(m["dimensionName"], eval_cols, live)
         if note:
             notes.append(f"{m['name']}: {note}")
     table(
