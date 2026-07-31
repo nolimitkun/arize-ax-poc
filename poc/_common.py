@@ -92,6 +92,26 @@ def table(title: str, columns: list[str], rows: list[list[Any]]) -> None:
     console.print(t)
 
 
+def mcnemar_p(only_a_passed: int, only_b_passed: int) -> float:
+    """Two-sided exact McNemar p-value for paired pass/fail outcomes.
+
+    Used wherever two variants are measured on the *same* rows -- poc/08's v1
+    against v2, poc/06b's judge against its aligned self. Because the rows are
+    shared, the only informative ones are those where the two disagree. Under
+    the null those disagreements split 50/50, which makes this a plain two-sided
+    binomial test on `only_b_passed` out of the total disagreement. Exact rather
+    than the chi-square approximation because these counts are small.
+    """
+    from math import comb
+
+    n = only_a_passed + only_b_passed
+    if n == 0:
+        return 1.0
+    k = min(only_a_passed, only_b_passed)
+    tail = sum(comb(n, i) for i in range(k + 1)) / (2**n)
+    return min(1.0, 2 * tail)
+
+
 def done(*next_steps: str) -> None:
     console.print()
     if next_steps:

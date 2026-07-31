@@ -5,6 +5,10 @@ This is the "find failures" step the Improve-Your-Agent guide opens with. It
 pulls spans back out of AX with the SDK, reconstructs each agent turn's
 trajectory, and applies the code checks that identify the seeded failure modes.
 
+What it finds is then written *back* onto the spans as metadata, so the trace
+view can be filtered by failure mode. An analysis that stays in a local
+dataframe leaves the UI no better than it was.
+
 The output feeds steps 04 (evals), 06 (annotation) and 07 (dataset).
 
 Docs: https://arize.com/docs/ax/observe/tracing/view-and-manage-traces
@@ -100,10 +104,51 @@ def check_verbose(answer: str, limit: int = 250) -> bool:
     return len(answer.split()) > limit
 
 
+def enrich_spans(client, settings, turns: pd.DataFrame) -> None:
+    """Write the failure classification back onto the spans it describes.
+
+    Without this the verdicts live only in `.out/03_turns.parquet`, which means
+    the one place you cannot answer "show me the hallucinations" is the trace
+    view -- the place you go when you want to read one. `update_metadata` takes
+    a JSON Merge Patch, and any `attributes.metadata.*` column is converted into
+    one automatically, so the columns below become filterable span fields.
+
+    Metadata rather than an eval: these are code checks over a local fixture,
+    not a graded judgement, and mixing them into `eval.*` would put two
+    different kinds of claim in the same namespace. Step 04 owns `eval.*`.
+    """
+    patch = pd.DataFrame(
+        {
+            "context.span_id": turns["span_id"].astype(str),
+            # "none" rather than "" -- an empty string is indistinguishable from
+            # an unset field in the UI filter, and "no failures" is a finding.
+            "attributes.metadata.failure_mode": turns["failures"].replace("", "none"),
+            "attributes.metadata.failure_count": turns["failures"].apply(
+                lambda f: len([m for m in f.split(",") if m])
+            ),
+            "attributes.metadata.question_id": turns["question_id"].astype(str),
+            "attributes.metadata.expected_behavior": turns["expected_behavior"].astype(str),
+            "attributes.metadata.answer_words": turns["answer_words"].astype(int),
+        }
+    )
+    client.spans.update_metadata(
+        space_id=settings.arize_space_id,
+        project_name=settings.arize_project_name,
+        dataframe=patch,
+    )
+    console.print(
+        f"[green]Tagged {len(patch)} spans[/green] with "
+        "`metadata.failure_mode` — filterable in the trace view."
+    )
+
+
 @app.command()
 def main(
     hours: int = typer.Option(24, help="How far back to export"),
     limit: int = typer.Option(0, help="Cap rows for a quick look (0 = no cap)"),
+    skip_metadata: bool = typer.Option(
+        False, help="Don't write the failure classification back onto the spans"
+    ),
 ) -> None:
     settings = header(
         "03",
@@ -240,12 +285,24 @@ def main(
     save("03_turns.parquet", turns)
     save("03_failures.parquet", turns[turns["is_failure"]].copy())
 
+    if not skip_metadata:
+        console.print("\nTagging the spans with what was found…")
+        try:
+            enrich_spans(client, settings, turns)
+        except Exception as exc:  # noqa: BLE001 - the export above is the real work
+            console.print(
+                f"[yellow]Could not write span metadata: {type(exc).__name__}: {exc}[/yellow]"
+            )
+
     look_at(
         "Traces → sort by latency, and open the slowest turn.",
         "Filter to the refund questions and read the answers — that is the "
         "hallucination this whole loop exists to fix.",
         "Compare an order question's trace against `expected_tools`: v1 reaches "
         "for search_docs instead of lookup_order.",
+        "Filter `metadata.failure_mode = 'hallucination'` — the classification "
+        "this step just computed is now a span field, so the failing turns are "
+        "one filter away instead of one parquet file away.",
     )
     done(
         "poc/04_offline_evals.py — LLM-as-judge over these spans",

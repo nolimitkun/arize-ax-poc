@@ -130,9 +130,17 @@ def run_turn(
     user_id: str | None = None,
     extra_metadata: dict[str, Any] | None = None,
     tags: list[str] | None = None,
+    model: str | None = None,
 ) -> TurnResult:
-    """Run one user turn end to end, emitting a full trace."""
+    """Run one user turn end to end, emitting a full trace.
+
+    `model` overrides the answer model only; the intent router keeps its own
+    cheap model either way. It exists so poc/08 can hold the prompt fixed and
+    vary the model instead -- the same experiment machinery, a different
+    independent variable.
+    """
     version = prompt_version or settings.prompt_version
+    answer_model = model or AGENT_MODEL
     session_id = session_id or f"sess-{uuid.uuid4().hex[:12]}"
     client = _client(settings)
     system_prompt = load_prompt(version, settings=settings)
@@ -147,7 +155,7 @@ def run_turn(
 
     metadata = {
         "prompt_version": version,
-        "agent_model": AGENT_MODEL,
+        "agent_model": answer_model,
         "turn_index": len(history or []) // 2,
         **(extra_metadata or {}),
     }
@@ -171,7 +179,7 @@ def run_turn(
                     # max_tokens covers the CoT as well as the answer, so it is
                     # sized for thinking rather than for a ~150-word reply.
                     resp = client.chat.completions.create(
-                        model=AGENT_MODEL,
+                        model=answer_model,
                         max_tokens=8192,
                         messages=[{"role": "system", "content": system_prompt}, *messages],
                         tools=tools,

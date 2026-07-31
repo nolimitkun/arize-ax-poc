@@ -15,11 +15,19 @@ would throw away most of the real signal.
 A control group of turns that already passed is included too -- without it you
 can "fix" hallucination by making the agent refuse everything and never notice.
 
+The human review from step 06 is then folded back in: the reviewed examples get
+the reviewer's verdict as a field *and* as a dataset annotation. That is what
+makes this a golden dataset rather than an export -- the labels a human produced
+in step 06 would otherwise stay on the spans and never reach the artefact the
+experiments actually run against.
+
 Docs: https://arize.com/docs/ax/improve/build-a-dataset
+      https://arize.com/docs/ax/evaluate/human-review
 """
 
 from __future__ import annotations
 
+import pandas as pd
 import typer
 
 from _common import arize_client, console, done, header, load, look_at, save, table
@@ -96,10 +104,144 @@ def merge_eval_verdicts(turns):
     return merged
 
 
+ANNOTATION_NAME = "human_groundedness"
+
+
+def existing_examples(client, space: str, name: str) -> dict[str, str]:
+    """`source_span_id` -> example id, for the examples already in the dataset.
+
+    The ids are assigned server-side, so the only way back to "which example is
+    this turn" is the `source_span_id` field written at creation time.
+    """
+    response = client.datasets.list_examples(dataset=name, space=space, all=True)
+    index: dict[str, str] = {}
+    for _key, value in response:
+        if not isinstance(value, list):
+            continue
+        for example in value:
+            props = getattr(example, "additional_properties", None) or {}
+            span = str(props.get("source_span_id", ""))
+            if span:
+                index[span] = str(example.id)
+    return index
+
+
+def existing_annotation_counts(client, space: str, name: str) -> list[str]:
+    """Example ids that read back carrying at least one annotation."""
+    response = client.datasets.list_examples(dataset=name, space=space, all=True)
+    found = []
+    for _key, value in response:
+        if not isinstance(value, list):
+            continue
+        found.extend(str(e.id) for e in value if getattr(e, "annotations", None))
+    return found
+
+
+def promote_human_labels(client, settings, name: str, new_version: str) -> None:
+    """Write step 06's human verdicts back onto the dataset examples.
+
+    Two calls, because they do different things and the docs treat them as
+    different features. `update_examples` adds fields to the example itself, so
+    the verdict travels with the row into every experiment that reads it.
+    `annotate_examples` records it as an annotation keyed by annotation config,
+    which is what the Datasets UI shows as human feedback and what can be
+    overwritten by a later review without rewriting the example.
+    """
+    from arize._generated.api_client.models import AnnotateRecordInput, AnnotationInput
+
+    try:
+        labels = load("06_annotations.parquet")
+    except SystemExit:
+        console.print(
+            "\n[dim]No 06_annotations.parquet — skipping the human-review merge. "
+            "Run poc/06_annotations.py to fold reviewer verdicts into the dataset.[/dim]"
+        )
+        return
+
+    label_col = f"annotation.{ANNOTATION_NAME}.label"
+    text_col = f"annotation.{ANNOTATION_NAME}.text"
+    if label_col not in labels.columns:
+        console.print(f"[yellow]{label_col} not present in the annotations.[/yellow]")
+        return
+
+    space = settings.arize_space_name
+    by_span = existing_examples(client, space, name)
+    if not by_span:
+        console.print("[yellow]No examples carried a source_span_id — nothing to merge.[/yellow]")
+        return
+
+    updates, annotations = [], []
+    for _, row in labels.iterrows():
+        example_id = by_span.get(str(row["context.span_id"]))
+        if not example_id:
+            continue  # reviewed a turn that didn't make it into the dataset
+        verdict = str(row[label_col])
+        reason = str(row.get(text_col, "") or "")
+        updates.append(
+            {"id": example_id, "human_label": verdict, "human_reason": reason}
+        )
+        annotations.append(
+            AnnotateRecordInput(
+                record_id=example_id,
+                values=[
+                    # No `score`. The config created in step 06 is categorical,
+                    # and the platform derives the score from the label -- send
+                    # one anyway and the whole batch 422s with "score must not
+                    # be set for categorical configs".
+                    AnnotationInput(name=ANNOTATION_NAME, label=verdict, text=reason[:1000])
+                ],
+            )
+        )
+
+    if not updates:
+        console.print(
+            "\n[yellow]None of the reviewed spans are in this dataset.[/yellow] "
+            "[dim]Step 06 reviews the highest-priority turns; step 07 selects on eval "
+            "verdicts, so the two sets overlap but do not coincide.[/dim]"
+        )
+        return
+
+    console.print(f"\nFolding [bold]{len(updates)}[/bold] human verdicts back into the dataset…")
+    client.datasets.update_examples(
+        dataset=name,
+        space=space,
+        examples=updates,
+        **({"new_version": new_version} if new_version else {}),
+    )
+    reviewed = pd.Series([u["human_label"] for u in updates]).value_counts()
+    console.print(
+        f"[green]{len(updates)} examples[/green] now carry a reviewer verdict as a field "
+        f"({', '.join(f'{k}={v}' for k, v in reviewed.items())})"
+        + (f", written as dataset version [bold]{new_version}[/bold]." if new_version else ".")
+    )
+
+    client.datasets.annotate_examples(dataset=name, space=space, annotations=annotations)
+    # The call is accepted and raises nothing, but the annotations do not come
+    # back through `list_examples` -- checked repeatedly over several minutes.
+    # Either the write is not landing or the read path does not surface it, and
+    # from here the two are indistinguishable. Reporting "wrote N annotations"
+    # on the strength of a clean return would be the exact failure this POC
+    # keeps finding, so the step says what it can actually confirm.
+    visible = sum(1 for eid in existing_annotation_counts(client, space, name) if eid)
+    if visible:
+        console.print(f"[green]{visible} of them are readable back as annotations.[/green]")
+    else:
+        console.print(
+            f"[yellow]The same {len(annotations)} verdicts were also written as dataset "
+            "annotations, but none read back through the SDK.[/yellow] "
+            "[dim]annotate_examples() returns cleanly; `list_examples` reports no "
+            "annotations minutes later. Check the Datasets UI before relying on it — "
+            "the `human_label` field above is the part this step can vouch for.[/dim]"
+        )
+
+
 @app.command()
 def main(
     name: str = typer.Option(DATASET_NAME, help="Dataset name in Arize"),
     controls: int = typer.Option(12, help="Passing turns to include as a control group"),
+    new_version: str = typer.Option(
+        "", help="Name a new dataset version for the human-review merge (default: in place)"
+    ),
 ) -> None:
     settings = header(
         "07",
@@ -167,16 +309,29 @@ def main(
             f"with {len(examples)} examples"
         )
     except Exception as exc:  # noqa: BLE001 - re-runs hit "already exists"
-        console.print(f"[yellow]Create failed ({exc}); appending to the existing dataset.[/yellow]")
-        client.datasets.append_examples(
-            dataset=name,
-            space=settings.arize_space_name,
-            examples=examples,
-        )
+        console.print(f"[yellow]Create failed ({exc}); reconciling with the existing one.[/yellow]")
+        # Append only what is genuinely new. Appending the whole batch every time
+        # is how this dataset reached 105 examples for 35 turns -- three runs of
+        # the same tour, each adding a full duplicate set, silently tripling
+        # every experiment that reads it.
+        known = existing_examples(client, settings.arize_space_name, name)
+        fresh = [e for e in examples if str(e["source_span_id"]) not in known]
+        if fresh:
+            client.datasets.append_examples(
+                dataset=name,
+                space=settings.arize_space_name,
+                examples=fresh,
+            )
+            console.print(
+                f"[green]Appended {len(fresh)} new examples[/green] to {name} "
+                f"({len(examples) - len(fresh)} were already there)."
+            )
+        else:
+            console.print(
+                f"[green]All {len(examples)} examples are already in {name}[/green] "
+                "— nothing appended."
+            )
         dataset = client.datasets.get(dataset=name, space=settings.arize_space_name)
-        console.print(f"[green]Appended {len(examples)} examples[/green] to {name}")
-
-    import pandas as pd
 
     df = pd.DataFrame(examples)
     save("07_dataset.parquet", df)
@@ -194,15 +349,34 @@ def main(
         ],
     )
 
+    merge_failed = False
+    try:
+        promote_human_labels(client, settings, name, new_version)
+    except Exception as exc:  # noqa: BLE001 - reported, then exited non-zero below
+        merge_failed = True
+        console.print(
+            f"\n[red]Merging the human review failed:[/red] {type(exc).__name__}: {exc}"
+        )
+
     look_at(
         f"Datasets → {name}. Each example carries the question plus its expected behaviour.",
-        "Dataset versions — appending creates a new version, so an experiment is "
-        "always pinned to known inputs.",
+        "Open an example that was reviewed: `human_label` is a field on the row, "
+        "carried into every experiment that reads the dataset.",
+        "Check whether the same verdict also shows as an annotation — the write is "
+        "accepted but does not read back through the SDK, so the UI is the only way "
+        "to tell whether it landed.",
+        "Dataset versions — note that appending writes into the *latest* version "
+        "rather than creating one. Pass --new-version to cut a new one, which is "
+        "what pins an experiment to a fixed set of inputs.",
         "[bold]Open the dataset in Prompt Playground[/bold] (UI only): edit the system "
         "prompt against these exact inputs and see answers change side by side. "
         "That is the manual version of what step 08 automates.",
     )
     done("poc/08_experiments.py — run v1 vs v2 against this dataset")
+    if merge_failed:
+        # The dataset exists, so the output above is real -- but half the step
+        # did not happen, and `make all` has to be able to see that.
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

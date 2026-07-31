@@ -1,9 +1,20 @@
 #!/usr/bin/env python
-"""Step 08 -- Improve: v1 vs v2 on the same dataset, with the same evaluators.
+"""Step 08 -- Improve: compare variants on the same dataset, same evaluators.
 
 This is the acceptance test for the whole POC. Same inputs, same graders, one
-variable changed (the system prompt and tool descriptions). If v2 doesn't beat
-v1 here, the improvement isn't real.
+variable changed. If the candidate doesn't beat the baseline here, the
+improvement isn't real.
+
+Two variables are worth changing, and the machinery is identical for both:
+
+  prompt   v1 -> v2 on the same model   -- did the rewrite help?
+  model    pro -> flash on the same v2 prompt -- how much quality does the
+           cheaper model actually cost?
+
+The second is the question a prompt-only experiment cannot answer, and it is
+usually the one with money attached. Each arm is compared against the run that
+differs from it by exactly one thing -- the model arm against the candidate
+prompt, not against the baseline -- and both go through the same paired test.
 
 Docs: https://arize.com/docs/ax/improve/set-up-an-experiment
       https://arize.com/docs/ax/improve/experiment-in-code
@@ -17,7 +28,7 @@ from typing import Any
 
 import typer
 
-from _common import console, done, header, look_at, table
+from _common import console, done, header, look_at, mcnemar_p, table
 
 app = typer.Typer(add_completion=False)
 
@@ -48,15 +59,21 @@ def field(row: Any, *names: str) -> str:
     return ""
 
 
-def build_task(settings, version: str):
+def build_task(settings, version: str, model: str | None = None):
     """Task fn for `experiments.run`: a dataset row in, this run's result out.
 
     Returns a dict rather than the answer string, because a groundedness judge
     has to see the documentation *this* run retrieved. Grading the new answer
     against the baseline's context, or against a fresh search, would be grading
     something that never happened.
+
+    `model` is the second independent variable. It is recorded in the span
+    metadata as well as the experiment metadata so a row in the results frame
+    can be traced back to the model that produced it.
     """
     from copilot.agent import run_turn
+
+    variant = version if model is None else f"{version}-{model}"
 
     def task(dataset_row) -> dict:
         question = field(dataset_row, "question", "input.value")
@@ -66,8 +83,9 @@ def build_task(settings, version: str):
             question,
             settings=settings,
             prompt_version=version,
+            model=model,
             tags=["experiment", f"prompt-{version}"],
-            extra_metadata={"experiment_variant": version},
+            extra_metadata={"experiment_variant": variant},
         )
         return {
             "answer": result.answer,
@@ -192,25 +210,6 @@ def example_key(df) -> str | None:
     return None
 
 
-def mcnemar_p(only_v1_passed: int, only_v2_passed: int) -> float:
-    """Two-sided exact McNemar p-value for paired pass/fail outcomes.
-
-    Both variants answer the same inputs, so the comparison is paired and the
-    only informative rows are those where the two disagree. Under the null the
-    disagreements split 50/50, which makes this a plain two-sided binomial test
-    on `only_v2_passed` out of `only_v1_passed + only_v2_passed`. Exact rather
-    than the chi-square approximation because these counts are small.
-    """
-    from math import comb
-
-    n = only_v1_passed + only_v2_passed
-    if n == 0:
-        return 1.0
-    k = min(only_v1_passed, only_v2_passed)
-    tail = sum(comb(n, i) for i in range(k + 1)) / (2**n)
-    return min(1.0, 2 * tail)
-
-
 def paired_verdict(base_df, cand_df, name: str) -> tuple[int, int, float] | None:
     """(only_v1_passed, only_v2_passed, p) for one evaluator, or None if unpairable."""
     key = example_key(base_df)
@@ -252,66 +251,21 @@ def mean_scores(df, names: list[str]) -> dict[str, float]:
     return out
 
 
-@app.command()
-def main(
-    dataset: str = typer.Option("copilot-failures", help="Dataset to run against"),
-    concurrency: int = typer.Option(4, help="Parallel task executions"),
-    baseline: str = typer.Option("v1", help="Baseline prompt version"),
-    candidate: str = typer.Option("v2", help="Candidate prompt version"),
-    dry_run: bool = typer.Option(False, help="Run on a 10-row sample only"),
-    judge_model: str = typer.Option(
-        "deepseek-v4-pro", help="Model backing the groundedness judge"
-    ),
-) -> None:
-    settings = header(
-        "08",
-        "Improve: baseline vs candidate experiment",
-        "set-up-an-experiment · experiment-in-code · run-evals-on-experiments",
-    )
+def compare(base_key: str, cand_key: str, summaries: dict, frames: dict) -> None:
+    """Render one baseline-vs-variant comparison, with its significance test.
 
-    from _common import arize_client
-    from copilot.tracing import flush, init_tracing
+    A delta alone is not a result. On 35 rows one flipped row moves a mean by
+    0.03, and an LLM judge re-run on identical inputs moves by about that much
+    on its own -- so "any positive delta wins" would declare victory on noise.
+    Each evaluator is therefore tested pairwise (same inputs, both variants) and
+    only counted when the disagreement is unlikely under chance.
 
-    init_tracing(settings)
-    client = arize_client(settings)
-    stamp = datetime.now(timezone.utc).strftime("%m%d-%H%M")
-    summaries: dict[str, dict[str, float]] = {}
-    frames: dict[str, Any] = {}
-
-    # The LLM judge is the same one poc/04 runs over production spans, so the
-    # experiment and the production measurement are directly comparable.
-    evaluators = [build_groundedness(settings, judge_model), *EVALUATORS]
-    names = [fn.__name__ for fn in EVALUATORS] + ["groundedness"]
-
-    for version in (baseline, candidate):
-        console.print(f"\n[bold cyan]Running {version}[/bold cyan] against '{dataset}'…")
-        experiment, results = client.experiments.run(
-            name=f"copilot-{version}-{stamp}",
-            dataset=dataset,
-            space=settings.arize_space_name,
-            task=build_task(settings, version),
-            evaluators=evaluators,
-            concurrency=concurrency,
-            dry_run=dry_run,
-            metadata={"prompt_version": version, "agent": "nimbus-copilot"},
-        )
-        flush()
-        summaries[version] = mean_scores(results, names)
-        frames[version] = results
-        console.print(
-            f"[green]{version} complete[/green] "
-            f"({len(results)} rows, experiment {getattr(experiment, 'id', 'dry-run')})"
-        )
-
-    # ---- the comparison --------------------------------------------------
-    #
-    # A delta alone is not a result. On 33 rows one flipped row moves a mean by
-    # 0.03, and an LLM judge re-run on identical inputs moves by about that much
-    # on its own -- so "any positive delta wins" would declare victory on noise.
-    # Each evaluator is therefore tested pairwise (same inputs, both variants)
-    # and only counted when the disagreement is unlikely under chance.
-    base, cand = summaries.get(baseline, {}), summaries.get(candidate, {})
-    base_df, cand_df = frames.get(baseline), frames.get(candidate)
+    Lifted out of main() so the model arm is held to the identical standard as
+    the prompt arm; a second, looser comparison written inline is how a cheaper
+    model ends up looking free.
+    """
+    base, cand = summaries.get(base_key, {}), summaries.get(cand_key, {})
+    base_df, cand_df = frames.get(base_key), frames.get(cand_key)
     rows, improved, regressed, inconclusive, unpaired = [], 0, 0, 0, 0
 
     for name in sorted(set(base) | set(cand)):
@@ -359,13 +313,13 @@ def main(
 
     console.print()
     table(
-        f"{baseline} vs {candidate}",
-        ["evaluator", baseline, candidate, "delta", "rows changed / McNemar"],
+        f"{base_key} vs {cand_key}",
+        ["evaluator", base_key, cand_key, "delta", "rows changed / McNemar"],
         rows,
     )
     console.print(
         "[dim]≈ means the change is not distinguishable from noise at p<0.05. "
-        "`3↑ 1↓` = 3 rows the candidate fixed, 1 it broke.[/dim]"
+        "`3↑ 1↓` = 3 rows the variant fixed, 1 it broke.[/dim]"
     )
 
     console.print()
@@ -383,7 +337,7 @@ def main(
     trailer = (" " + " ".join(notes)) if notes else ""
     if improved and not regressed:
         console.print(
-            f"[bold green]{candidate} wins.[/bold green] {improved} evaluator(s) improved "
+            f"[bold green]{cand_key} wins.[/bold green] {improved} evaluator(s) improved "
             f"significantly, none regressed.{trailer}\n"
         )
     elif improved and regressed:
@@ -395,25 +349,112 @@ def main(
         )
     elif regressed:
         console.print(
-            f"[bold red]{candidate} is worse.[/bold red] {regressed} evaluator(s) "
+            f"[bold red]{cand_key} is worse.[/bold red] {regressed} evaluator(s) "
             f"regressed significantly and none improved.{trailer}\n"
         )
     else:
         console.print(
-            "[bold red]No measurable improvement.[/bold red] Nothing moved beyond "
-            f"noise on {len(base_df) if base_df is not None else 0} rows."
-            f"{trailer} Read the per-row explanations in the Arize experiment view "
-            "before changing the prompt again — and note that a bigger dataset "
-            "raises what this test can detect.\n"
+            f"[bold]No measurable difference[/bold] between {base_key} and {cand_key}. "
+            f"Nothing moved beyond noise on {len(base_df) if base_df is not None else 0} "
+            f"rows.{trailer} Read the per-row explanations in the Arize experiment view "
+            "before changing anything again — and note that a bigger dataset raises "
+            "what this test can detect.\n"
         )
 
+
+@app.command()
+def main(
+    dataset: str = typer.Option("copilot-failures", help="Dataset to run against"),
+    concurrency: int = typer.Option(4, help="Parallel task executions"),
+    baseline: str = typer.Option("v1", help="Baseline prompt version"),
+    candidate: str = typer.Option("v2", help="Candidate prompt version"),
+    dry_run: bool = typer.Option(False, help="Run on a 10-row sample only"),
+    judge_model: str = typer.Option(
+        "deepseek-v4-pro", help="Model backing the groundedness judge"
+    ),
+    compare_model: str = typer.Option(
+        "deepseek-v4-flash",
+        help="Third arm: the candidate prompt on this model ('' to skip)",
+    ),
+) -> None:
+    settings = header(
+        "08",
+        "Improve: prompt and model variants against one baseline",
+        "set-up-an-experiment · experiment-in-code · run-evals-on-experiments",
+    )
+
+    from _common import arize_client
+    from copilot.config import AGENT_MODEL
+    from copilot.tracing import flush, init_tracing
+
+    init_tracing(settings)
+    client = arize_client(settings)
+    stamp = datetime.now(timezone.utc).strftime("%m%d-%H%M")
+    summaries: dict[str, dict[str, float]] = {}
+    frames: dict[str, Any] = {}
+
+    # The LLM judge is the same one poc/04 runs over production spans, so the
+    # experiment and the production measurement are directly comparable.
+    evaluators = [build_groundedness(settings, judge_model), *EVALUATORS]
+    names = [fn.__name__ for fn in EVALUATORS] + ["groundedness"]
+
+    # (arm label, prompt version, model override, what to compare it against).
+    #
+    # Each arm names its own reference so that exactly one variable differs
+    # across every comparison. The model arm is measured against the *candidate*
+    # prompt, not the baseline: comparing v2-on-flash to v1-on-pro would change
+    # the prompt and the model at once and could not attribute the difference to
+    # either.
+    arms: list[tuple[str, str, str | None, str | None]] = [
+        (baseline, baseline, None, None),
+        (candidate, candidate, None, baseline),
+    ]
+    if compare_model:
+        # The label becomes an experiment name, so it stays in the same
+        # [a-z0-9-] shape as the other arms rather than carrying an `@`.
+        arms.append(
+            (f"{candidate}-{compare_model.split('-')[-1]}", candidate, compare_model, candidate)
+        )
+
+    for label, version, model, _ in arms:
+        on = f" on [bold]{model}[/bold]" if model else ""
+        console.print(f"\n[bold cyan]Running {label}[/bold cyan]{on} against '{dataset}'…")
+        experiment, results = client.experiments.run(
+            name=f"copilot-{label}-{stamp}",
+            dataset=dataset,
+            space=settings.arize_space_name,
+            task=build_task(settings, version, model),
+            evaluators=evaluators,
+            concurrency=concurrency,
+            dry_run=dry_run,
+            metadata={
+                "prompt_version": version,
+                "agent_model": model or AGENT_MODEL,
+                "agent": "nimbus-copilot",
+            },
+        )
+        flush()
+        summaries[label] = mean_scores(results, names)
+        frames[label] = results
+        console.print(
+            f"[green]{label} complete[/green] "
+            f"({len(results)} rows, experiment {getattr(experiment, 'id', 'dry-run')})"
+        )
+
+    # ---- the comparisons -------------------------------------------------
+    for label, _version, _model, reference in arms:
+        if reference:
+            compare(reference, label, summaries, frames)
+
     look_at(
-        f"Experiments → copilot-{baseline}-{stamp} and copilot-{candidate}-{stamp}.",
-        "Select both and compare — Arize lays them out row by row on the same inputs.",
+        "Experiments → "
+        + ", ".join(f"copilot-{label}-{stamp}" for label, *_ in arms)
+        + ".",
+        "Select them and compare — Arize lays them out row by row on the same inputs.",
         "Sort by the groundedness score and read a row where v1 failed and v2 passed. "
         "The two answers next to each other are the whole argument for the change.",
         "Each experiment run is itself traced, so you can open the underlying trace "
-        "from any row.",
+        "from any row — including which model answered it.",
     )
     done("poc/09_prompt_hub.py — publish the winning prompt and load it at runtime")
 

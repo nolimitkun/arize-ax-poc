@@ -92,6 +92,9 @@ def simulated_human_label(row: pd.Series) -> tuple[str, float, str]:
 def main(
     sample: int = typer.Option(20, help="How many spans to put in the review queue"),
     skip_queue: bool = typer.Option(False, help="Skip queue creation, just write labels"),
+    label_all: bool = typer.Option(
+        True, help="Simulate labels for every turn, not just the queued ones"
+    ),
 ) -> None:
     settings = header(
         "06",
@@ -107,12 +110,24 @@ def main(
     client = arize_client(settings)
     turns = load("03_turns.parquet")
 
-    # Prioritise failing turns -- reviewer time is the scarce resource.
+    # Prioritise failing turns -- reviewer time is the scarce resource, and it is
+    # what caps the queue.
     ranked = turns.sort_values("is_failure", ascending=False).head(sample).copy()
+    # ...but the *simulated* labels cost nothing, and everything downstream is
+    # limited by how many of them there are. poc/06b splits these in half and
+    # runs a significance test on the holdout, which cannot resolve anything at
+    # n=10. So the queue stays realistic while the labels cover the full set.
+    labelled = turns.copy() if label_all else ranked
     console.print(
-        f"Selected [bold]{len(ranked)}[/bold] spans for review "
-        f"({int(ranked['is_failure'].sum())} already flagged by code checks).\n"
+        f"Selected [bold]{len(ranked)}[/bold] spans for the review queue "
+        f"({int(ranked['is_failure'].sum())} already flagged by code checks)."
     )
+    if label_all and len(labelled) > len(ranked):
+        console.print(
+            f"Simulating labels for all [bold]{len(labelled)}[/bold] turns "
+            f"[dim](--no-label-all to label only the queued {len(ranked)})[/dim]"
+        )
+    console.print()
 
     # ---- 1. Annotation config -------------------------------------------
     try:
@@ -182,11 +197,11 @@ def main(
 
     # ---- 3. Write human labels ------------------------------------------
     console.print("\n[bold]Writing (simulated) human labels[/bold]")
-    labels = ranked.apply(simulated_human_label, axis=1, result_type="expand")
+    labels = labelled.apply(simulated_human_label, axis=1, result_type="expand")
     now = datetime.now(timezone.utc)
     annotations = pd.DataFrame(
         {
-            "context.span_id": ranked["span_id"].astype(str).values,
+            "context.span_id": labelled["span_id"].astype(str).values,
             f"annotation.{ANNOTATION_NAME}.label": labels[0].values,
             f"annotation.{ANNOTATION_NAME}.score": labels[1].astype(float).values,
             f"annotation.{ANNOTATION_NAME}.text": labels[2].values,
