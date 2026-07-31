@@ -271,6 +271,9 @@ def check_judge_verdict_parsing() -> None:
         ("hallucinated\nInvented a 30-day window.", "hallucinated"),
         ("Verdict: grounded", "grounded"),
         ("**hallucinated**", "hallucinated"),
+        # Markdown emphasis with underscores. A `[a-z_]+` character class makes
+        # this one unknown token and scores a caught hallucination as an error.
+        ("__hallucinated__", "hallucinated"),
         ("GROUNDED.", "grounded"),
         # The bug: substring matching scored these as passes.
         ("ungrounded\nNo support for the refund claim.", "error"),
@@ -545,6 +548,252 @@ def check_annotation_queue_inputs() -> None:
     )
 
 
+def check_judge_alignment() -> None:
+    """The alignment step is only worth anything if it cannot cheat."""
+    console.print("\n[bold]Judge alignment (step 06b)[/bold]")
+    from pathlib import Path as _Path
+
+    from copilot.evals import GROUNDEDNESS_TEMPLATE, build_aligned_template
+
+    example = {
+        "question": "Can I get a refund?",
+        "context": "No refund policy is documented.",
+        # A real answer can contain braces. The aligned template is spliced
+        # together and then `.format`ted, so an unescaped one raises KeyError on
+        # every subsequent grading call -- the judge would fail closed, silently.
+        "answer": 'Sure: {"refund": "30 days"}',
+        "label": "hallucinated",
+        "reason": "Invented a window.",
+    }
+    aligned = build_aligned_template([example])
+    check("worked examples land before the case being graded",
+          aligned.index("Reviewed case 1") < aligned.index("{question}"))
+    try:
+        aligned.format(question="q", retrieved_context="c", answer="a")
+        formats = True
+    except (KeyError, IndexError, ValueError):
+        formats = False
+    check("a brace in an answer doesn't break the template", formats)
+
+    unescaped = build_aligned_template([example], escape=False)
+    check("escape=False leaves AX's own placeholders alone", "{{" not in unescaped)
+    check("no examples means the template is untouched",
+          build_aligned_template([]) == GROUNDEDNESS_TEMPLATE)
+
+    source = _Path(__file__).with_name("06b_align_judge.py").read_text()
+    # Mining few-shot examples from the rows you then score is train-on-test: it
+    # reports a large gain every time and measures nothing.
+    check("agreement is measured on rows the examples were not drawn from",
+          "def split(" in source and "holdout" in source)
+    check("...and the split is stratified, so both halves carry disagreements",
+          'groupby("agreed"' in source)
+    check("the result is tested, not just differenced", "mcnemar_p(" in source)
+    check("too few discordant rows is called out rather than glossed over",
+          "fixed + broken < 6" in source)
+    # The hosted template has no retrieved-context placeholder, so it grades
+    # groundedness blind. Attaching the offline judge's holdout number to that
+    # version's commit message would describe a judge that was never measured.
+    check("the published version doesn't borrow the offline judge's number",
+          "grades_blind" in source and "Offline holdout agreement" in source)
+    check("...and the discrepancy is surfaced when it applies",
+          "no retrieved-context" in source)
+
+    import importlib
+
+    module = importlib.import_module("06b_align_judge")
+    ax = importlib.import_module("05_online_evals")
+    # Detecting this from the prose finds the hosted template's own sentence
+    # about "documentation it retrieved" and concludes it has the documents,
+    # when its only placeholders are input.value and output.value.
+    check("the offline template is seen to supply context",
+          module.supplies_context(GROUNDEDNESS_TEMPLATE))
+    check("the hosted template is correctly seen NOT to",
+          not module.supplies_context(ax.GROUNDEDNESS_TEMPLATE))
+
+
+def check_session_evals() -> None:
+    """A session score written to every span silently weights by conversation length."""
+    console.print("\n[bold]Session-level evaluation (step 04b)[/bold]")
+    import importlib
+    from pathlib import Path
+
+    import pandas as pd
+
+    module = importlib.import_module("04b_session_evals")
+
+    turns = pd.DataFrame(
+        [
+            {"session_id": "s1", "span_id": "a", "question": "q1", "answer": "a1",
+             "tool_calls": "", "is_failure": False, "start_time": 1},
+            {"session_id": "s1", "span_id": "b", "question": "q2", "answer": "a2",
+             "tool_calls": "escalate_ticket", "is_failure": False, "start_time": 2},
+            {"session_id": "s2", "span_id": "c", "question": "q3", "answer": "a3",
+             "tool_calls": "", "is_failure": True, "start_time": 3},
+            {"session_id": "", "span_id": "d", "question": "q4", "answer": "a4",
+             "tool_calls": "", "is_failure": False, "start_time": 4},
+        ]
+    )
+    turns["turn_failed"] = turns["is_failure"]
+    built = module.build_transcripts(turns)
+    check("one row per session, not per turn", len(built) == 2, f"got {len(built)}")
+
+    # Nothing documents the export as chronological, and `spans.list()` is
+    # explicitly descending. Fed the reverse order, an unsorted implementation
+    # hands the judge a backwards conversation and anchors the verdict on the
+    # opening turn -- both of which produce a plausible-looking score.
+    shuffled = module.build_transcripts(turns.iloc[::-1].reset_index(drop=True))
+    s1_shuffled = shuffled[shuffled["session_id"] == "s1"].iloc[0]
+    check("turn order survives a reversed input", s1_shuffled["span_id"] == "b",
+          s1_shuffled["span_id"])
+    check("...and so does the transcript",
+          s1_shuffled["transcript"].index("q1") < s1_shuffled["transcript"].index("q2"))
+    check("spans with no session id are dropped", "" not in set(built["session_id"]))
+    s1 = built[built["session_id"] == "s1"].iloc[0]
+    check("the verdict hangs on the session's last span", s1["span_id"] == "b", s1["span_id"])
+    check("the transcript carries both turns", "q1" in s1["transcript"] and "q2" in s1["transcript"])
+    check("tool calls are visible to the judge", "escalate_ticket" in s1["transcript"])
+    check("escalation is detected across the session", bool(s1["escalated"]))
+    check("turn-level failures are carried through for the comparison",
+          int(built[built["session_id"] == "s2"].iloc[0]["turn_failures"]) == 1)
+
+    # The headline claim -- "failed as a whole, no turn-level failure" -- is only
+    # meaningful if it clears every turn-level signal. Step 03's heuristics flag
+    # 10 turns on current traffic where step 04's evaluators flag 38, so scoring
+    # it on the heuristics alone counts sessions the judge already condemned.
+    source = Path(__file__).with_name("04b_session_evals.py").read_text()
+    check("the silent-session count consults step 04's verdicts too",
+          "TURN_FAILURE_EVALS" in source and "04_evals.parquet" in source)
+    check("...and reports which signals it cleared",
+          "verdict_sources" in source)
+    check("a turn is counted failed if either signal fires",
+          'merged["turn_failed"] | (merged[score_cols] < 1.0)' in source)
+
+    graded = pd.DataFrame(
+        [
+            # Heuristic-clean, but the judge flagged it: must not read as silent.
+            {"span_id": "a", "is_failure": False, "eval.groundedness.score": 0.0},
+            {"span_id": "b", "is_failure": False, "eval.groundedness.score": 1.0},
+        ]
+    )
+    graded["context.span_id"] = graded["span_id"]
+    combined = graded["is_failure"] | (graded[["eval.groundedness.score"]] < 1.0).any(axis=1)
+    check("an eval-flagged, heuristic-clean turn counts as a failure",
+          bool(combined.iloc[0]) and not bool(combined.iloc[1]))
+    # NaN means never graded, which is not evidence of a failure.
+    ungraded = pd.DataFrame([{"eval.groundedness.score": float("nan")}])
+    check("an ungraded turn is not counted as a failure",
+          not bool((ungraded[["eval.groundedness.score"]] < 1.0).any(axis=1).iloc[0]))
+
+    from copilot.evals import SESSION_CHOICES, parse_verdict
+
+    check("three ordered outcomes, so 'unhelpful' and 'harmful' differ",
+          len(SESSION_CHOICES) == 3 and SESSION_CHOICES["unresolved"] > SESSION_CHOICES["frustrated"])
+    label, _, _ = parse_verdict("unresolved\nNothing was fixed.", SESSION_CHOICES)
+    check("a multi-word label parses on its own scale", label == "unresolved", label)
+
+
+def check_backfill_spans() -> None:
+    """Backfilled spans must be reproducible and must not pollute the live project."""
+    console.print("\n[bold]Direct span ingestion (step 02b)[/bold]")
+    import importlib
+    from pathlib import Path as _Path
+
+    module = importlib.import_module("02b_log_spans")
+
+    spans, evals = module.build_history(module.HISTORIC_TICKETS, 30)
+    required = {"context.trace_id", "context.span_id", "name"}
+    check("the required OpenInference columns are present", required <= set(spans.columns))
+    check("ids are stable across builds, so a re-run replaces rather than doubles",
+          spans["context.span_id"].tolist()
+          == module.build_history(module.HISTORIC_TICKETS, 30)[0]["context.span_id"].tolist())
+    check("span ids are unique", spans["context.span_id"].is_unique)
+    roots = spans[spans["parent_id"] == ""]
+    check("every trace has exactly one root", len(roots) == len(module.HISTORIC_TICKETS))
+    children = spans[spans["parent_id"] != ""]
+    check("children point at a root that exists",
+          set(children["parent_id"]) <= set(roots["context.span_id"]))
+    check("evals join to the root spans only",
+          set(evals["context.span_id"]) == set(roots["context.span_id"]))
+    check("start precedes end on every span", bool((spans["end_time"] > spans["start_time"]).all()))
+
+    source = _Path(__file__).with_name("02b_log_spans.py").read_text()
+    # Mixing backfilled rows into the analysed project would change every count
+    # step 03 reports, with nothing marking them as a different source.
+    check("it targets its own project, not the one step 03 analyses",
+          '-backfill' in source)
+    check("read-back polls rather than reading once",
+          "POLL_ATTEMPTS" in source)
+
+
+def check_span_metadata_enrichment() -> None:
+    """Findings that stay in a local parquet leave the trace view no better off."""
+    console.print("\n[bold]Span metadata enrichment (step 03)[/bold]")
+    from pathlib import Path
+
+    source = Path(__file__).with_name("03_query_spans.py").read_text()
+    check("the failure classification is written back to the spans",
+          "update_metadata(" in source)
+    check("...under attributes.metadata.*, which AX converts to a merge patch",
+          "attributes.metadata.failure_mode" in source)
+    # "" and "unset" are the same thing in a UI filter, and "no failures" is a
+    # finding rather than an absence.
+    check('a clean turn is tagged "none", not empty', '.replace("", "none")' in source)
+    check("it can be turned off without skipping the export", "skip_metadata" in source)
+    # Without this column step 04b cannot order a conversation at all.
+    check("start_time is carried through for the session judge",
+          '"start_time": find_col(' in source and '"start_time": span.get(' in source)
+
+
+def check_dataset_lifecycle() -> None:
+    """A dataset that grows by a full copy per run silently triples every experiment."""
+    console.print("\n[bold]Dataset lifecycle (step 07)[/bold]")
+    from pathlib import Path
+
+    source = Path(__file__).with_name("07_dataset.py").read_text()
+    check("re-runs append only what is new", "fresh = [e for e in examples" in source)
+    check("human verdicts reach the dataset as fields", "update_examples(" in source)
+    check("...and are attempted as annotations too", "annotate_examples(" in source)
+    # The platform rejects the whole batch if a score is sent for a categorical
+    # config, and step 06 creates a categorical one.
+    check("no score is sent with a categorical annotation",
+          "AnnotationInput(name=ANNOTATION_NAME, label=verdict" in source
+          and "score=float(row.get" not in source)
+    check("a failed merge exits non-zero instead of printing a summary",
+          "merge_failed" in source)
+    # Both dataset endpoints cap a request at 1000 records, and blowing the cap
+    # 4xxs partway through, leaving the dataset half-updated.
+    check("dataset writes are batched under the server's 1000-record cap",
+          "BATCH_LIMIT = 1000" in source and source.count("chunked(") == 3)
+
+
+def check_experiment_arms() -> None:
+    """Each arm has to differ from its reference by exactly one thing."""
+    console.print("\n[bold]Experiment arms (step 08)[/bold]")
+    import inspect
+    from pathlib import Path
+
+    source = Path(__file__).with_name("08_experiments.py").read_text()
+    check("the model is a variable, not a constant", "compare_model" in source)
+    check("run_turn accepts the override", "build_task(settings, version, model)" in source)
+    # v2-on-flash against v1-on-pro changes the prompt and the model at once,
+    # and no test can attribute the difference to either.
+    check("the model arm is measured against the candidate prompt, not the baseline",
+          "candidate,\n            )" in source or "reference" in source)
+    check("both arms go through the same paired test",
+          source.count("compare(reference, label") == 1 and "def compare(" in source)
+    # COPILOT_AGENT_MODEL can point the baseline arms at flash, in which case a
+    # flash comparison arm changes nothing and presents run-to-run noise as a
+    # model difference.
+    check("an arm that wouldn't change the model is skipped",
+          "compare_model == AGENT_MODEL" in source)
+    check("...and says why rather than silently dropping it",
+          "Skipping the model arm" in source)
+
+    from copilot.agent import run_turn
+
+    check("run_turn takes a model override", "model" in inspect.signature(run_turn).parameters)
+
+
 def check_prompts_and_tools() -> None:
     console.print("\n[bold]Prompts and tool schemas[/bold]")
     from copilot.prompts import V1, V2
@@ -766,6 +1015,12 @@ def main() -> None:
     check_prompt_hub_plumbing()
     check_monitor_metrics()
     check_annotation_queue_inputs()
+    check_judge_alignment()
+    check_session_evals()
+    check_backfill_spans()
+    check_span_metadata_enrichment()
+    check_dataset_lifecycle()
+    check_experiment_arms()
     check_prompts_and_tools()
     check_dataframe_contracts()
     check_targets_ax_not_phoenix()
