@@ -547,6 +547,32 @@ def check_annotation_queue_inputs() -> None:
         '.updated_by": reviewer,' in source,
     )
 
+    # A queue holds spans from one project but its name is unique per space, so
+    # a fixed name 409s on the second project and leaves the new one with no
+    # queue while the stale one still shows the old spans.
+    check(
+        "the queue name is scoped to the project",
+        "def queue_name(" in source and 'name="Groundedness review"' not in source,
+    )
+
+    # The simulated reviewer's noise has to be a property of the span, not of
+    # the interpreter. `hash()` on a str is salted per process, so the labels
+    # changed on every run -- and poc/06b splits exactly these labels into train
+    # and holdout to measure a template change against.
+    check(
+        "the label noise is a digest, not a salted hash()",
+        "hashlib.sha256" in source and "abs(hash(" not in source,
+    )
+    from importlib import import_module
+
+    module = import_module("06_annotations")
+    ids = [f"span{i:03d}" for i in range(40)]
+    check(
+        "...and lands on the same spans every run",
+        "".join("1" if module.is_noisy(i) else "0" for i in ids)
+        == "0000000100000000000000000000010000000000",
+    )
+
 
 def check_judge_alignment() -> None:
     """The alignment step is only worth anything if it cannot cheat."""

@@ -19,6 +19,7 @@ Docs: https://arize.com/docs/ax/evaluate/human-review
 
 from __future__ import annotations
 
+import hashlib
 import os
 from datetime import datetime, timezone
 
@@ -81,6 +82,25 @@ def reviewer_email(client) -> str:
     return REVIEWER_FALLBACK
 
 
+NOISE_RATE = 8  # percent of non-refund turns a reviewer flags anyway
+
+
+def is_noisy(span_id: str, rate: int = NOISE_RATE) -> bool:
+    """Deterministically decide whether this span draws a noisy label.
+
+    A digest rather than `hash()`. Python salts string hashes per process, so
+    `hash(span_id)` gives a different answer in every interpreter -- the same
+    span was labelled `grounded` on one run and `hallucinated` on the next.
+    That is not the noise this is modelling. A real reviewer's mistakes are a
+    fixed property of the case they misread, and the version here has to be too:
+    poc/06b splits these labels into train and holdout and measures a template
+    change against them, which means nothing if the labels move underneath it.
+    Re-running poc/06 also overwrites the annotations in AX, so the drift was
+    being published, not just held locally.
+    """
+    return int.from_bytes(hashlib.sha256(span_id.encode()).digest()[:8], "big") % 100 < rate
+
+
 def simulated_human_label(row: pd.Series) -> tuple[str, float, str]:
     """Stand-in for a human reviewer.
 
@@ -101,8 +121,7 @@ def simulated_human_label(row: pd.Series) -> tuple[str, float, str]:
         return "hallucinated", 0.0, "Stated a refund policy that is not in the documentation."
 
     # Non-refund turns: mostly grounded, with a little reviewer noise.
-    noisy = (abs(hash(str(row.get("span_id", "")))) % 100) < 8
-    if noisy:
+    if is_noisy(str(row.get("span_id", ""))):
         return "hallucinated", 0.0, "Reviewer flagged an unsupported detail in the answer."
     return "grounded", 1.0, "Claims trace back to the retrieved documentation."
 
