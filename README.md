@@ -541,7 +541,12 @@ The one thing worth keeping across resets is the AI integration
 provider key, and step 05 finds it by id.
 
 Renaming the project does not rename anything else, so a second tour reuses the
-same dataset, evaluator and queue. That is usually what you want — the evaluator
-keeps its version history, and step 07 now appends only examples it hasn't seen.
-Pass `poc/07_dataset.py --name <something>` if you want a dataset scoped to one
-tour instead.
+same dataset and evaluator. That is usually what you want — the evaluator keeps
+its version history, and step 07 now appends only examples it hasn't seen. Pass
+`poc/07_dataset.py --name <something>` if you want a dataset scoped to one tour
+instead.
+
+The review queue is the exception, and it has to be: a queue holds spans from
+one project, so step 06 names it `Groundedness review (<project>)` and each tour
+gets its own. The annotation config stays shared, because that one is a label
+schema rather than a pile of records.

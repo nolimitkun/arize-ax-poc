@@ -19,6 +19,7 @@ Docs: https://arize.com/docs/ax/evaluate/human-review
 
 from __future__ import annotations
 
+import hashlib
 import os
 from datetime import datetime, timezone
 
@@ -37,6 +38,25 @@ ANNOTATION_NAME = "human_groundedness"
 # placeholder is what gets written into the annotation's `updated_by` when no
 # real user can be found.
 REVIEWER_FALLBACK = "poc-reviewer@example.com"
+
+
+def queue_name(project: str) -> str:
+    """One review queue per project, not one per space.
+
+    The annotation config above is deliberately space-wide -- it is a label
+    schema, and every tour should grade against the same one. A queue is the
+    opposite: its records are spans in a single project, so a fixed name is
+    wrong the moment there is a second project.
+
+    That is not hypothetical here. A reset in this POC is a project *rename*
+    (deleting a project poisons its name -- see the README), so the second tour
+    hits a 409 on a queue that still exists and still points at the first
+    tour's spans. The failure is quiet in the worst way: labels keep landing on
+    the new project's spans and the agreement number stays correct, so nothing
+    downstream complains, while the queue a reviewer actually opens shows the
+    old traffic.
+    """
+    return f"Groundedness review ({project})"
 
 
 def reviewer_email(client) -> str:
@@ -62,6 +82,25 @@ def reviewer_email(client) -> str:
     return REVIEWER_FALLBACK
 
 
+NOISE_RATE = 8  # percent of non-refund turns a reviewer flags anyway
+
+
+def is_noisy(span_id: str, rate: int = NOISE_RATE) -> bool:
+    """Deterministically decide whether this span draws a noisy label.
+
+    A digest rather than `hash()`. Python salts string hashes per process, so
+    `hash(span_id)` gives a different answer in every interpreter -- the same
+    span was labelled `grounded` on one run and `hallucinated` on the next.
+    That is not the noise this is modelling. A real reviewer's mistakes are a
+    fixed property of the case they misread, and the version here has to be too:
+    poc/06b splits these labels into train and holdout and measures a template
+    change against them, which means nothing if the labels move underneath it.
+    Re-running poc/06 also overwrites the annotations in AX, so the drift was
+    being published, not just held locally.
+    """
+    return int.from_bytes(hashlib.sha256(span_id.encode()).digest()[:8], "big") % 100 < rate
+
+
 def simulated_human_label(row: pd.Series) -> tuple[str, float, str]:
     """Stand-in for a human reviewer.
 
@@ -82,8 +121,7 @@ def simulated_human_label(row: pd.Series) -> tuple[str, float, str]:
         return "hallucinated", 0.0, "Stated a refund policy that is not in the documentation."
 
     # Non-refund turns: mostly grounded, with a little reviewer noise.
-    noisy = (abs(hash(str(row.get("span_id", "")))) % 100) < 8
-    if noisy:
+    if is_noisy(str(row.get("span_id", ""))):
         return "hallucinated", 0.0, "Reviewer flagged an unsupported detail in the answer."
     return "grounded", 1.0, "Claims trace back to the retrieved documentation."
 
@@ -167,8 +205,9 @@ def main(
             # only accepted value is upper-case `SPAN`.
             from arize.annotation_queues.types import AnnotationQueueSpanRecordInput
 
+            name = queue_name(settings.arize_project_name)
             queue = client.annotation_queues.create(
-                name="Groundedness review",
+                name=name,
                 space=settings.arize_space_name,
                 annotation_config_ids=[config_id],
                 annotator_emails=[reviewer],
@@ -189,11 +228,16 @@ def main(
                 ],
             )
             console.print(
-                f"[green]Created review queue[/green] Groundedness review "
+                f"[green]Created review queue[/green] {name} "
                 f"({getattr(queue, 'id', '?')}) with {len(ranked)} records"
             )
         except Exception as exc:  # noqa: BLE001
             console.print(f"[yellow]Queue not created: {exc}[/yellow]")
+            console.print(
+                f"  [dim]No review queue for {settings.arize_project_name}. The labels "
+                "below still land on its spans, so the agreement number stands — but "
+                "there is nothing for a reviewer to open.[/dim]"
+            )
 
     # ---- 3. Write human labels ------------------------------------------
     console.print("\n[bold]Writing (simulated) human labels[/bold]")
