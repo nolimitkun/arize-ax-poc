@@ -503,6 +503,48 @@ def check_retrieval_accumulates() -> None:
     check("repeating a search does not duplicate ids", ctx.retrieved_doc_ids == ids_before)
 
 
+def check_annotation_queue_inputs() -> None:
+    """A queue that never gets created takes the human-review step with it."""
+    console.print("\n[bold]Annotation queue plumbing[/bold]")
+    from pathlib import Path as _Path
+
+    source = _Path(__file__).with_name("06_annotations.py").read_text()
+
+    # A plain dict is routed through AnnotationQueueRecordInput.from_dict, which
+    # json.dumps it -- and the record source carries two datetimes, so the call
+    # dies with "Object of type datetime is not JSON serializable". The typed
+    # input serialises them properly.
+    check(
+        "the queue's record source is the typed input, not a dict",
+        "AnnotationQueueSpanRecordInput(" in source,
+    )
+    check(
+        "record_type is the upper-case enum value the schema accepts",
+        'record_type="SPAN"' in source and '"record_type": "span"' not in source,
+    )
+
+    # Both failures above were swallowed into a one-line yellow warning, so the
+    # step reported success for weeks while creating nothing. The reason has to
+    # reach the console.
+    queue_block = source.split("Queue not created")[1][:120]
+    check("a failed queue creation prints why", "{exc}" in queue_block, queue_block.strip()[:60])
+
+    # Arize 404s unless every annotator is a real user with space access, so a
+    # hardcoded placeholder makes this work for nobody.
+    check(
+        "the annotator is resolved from the account, not hardcoded",
+        "def reviewer_email(" in source and "annotator_emails=[reviewer]" in source,
+    )
+    check(
+        "...with an env override for multi-seat accounts",
+        "POC_REVIEWER_EMAIL" in source,
+    )
+    check(
+        "the same reviewer is recorded on the annotations",
+        '.updated_by": reviewer,' in source,
+    )
+
+
 def check_prompts_and_tools() -> None:
     console.print("\n[bold]Prompts and tool schemas[/bold]")
     from copilot.prompts import V1, V2
@@ -723,6 +765,7 @@ def main() -> None:
     check_judge_verdict_parsing()
     check_prompt_hub_plumbing()
     check_monitor_metrics()
+    check_annotation_queue_inputs()
     check_prompts_and_tools()
     check_dataframe_contracts()
     check_targets_ax_not_phoenix()

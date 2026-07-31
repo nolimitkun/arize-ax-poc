@@ -129,38 +129,57 @@ make monitor    # 10
 make all        # everything, in order
 ```
 
-**The acceptance criterion is step 08**, and on the current dataset it is *not*
-met. Measured on 33 examples against `deepseek-v4-pro`:
+**The acceptance criterion is step 08.** On the current dataset it is met, on
+one of three evaluators. Measured on 35 examples against `deepseek-v4-pro`:
 
 | evaluator | v1 | v2 | delta | rows changed | McNemar |
 |---|---|---|---|---|---|
-| `answers_from_context` | 0.97 | 1.00 | +0.03 ≈ | 1↑ 0↓ | p=1.000 |
-| `conciseness` | 0.82 | 0.91 | +0.09 ≈ | 3↑ 0↓ | p=0.250 |
-| `groundedness` | 0.55 | 0.52 | −0.03 ≈ | 1↑ 2↓ | p=1.000 |
+| `answers_from_context` | 1.00 | 1.00 | +0.00 ≈ | 0↑ 0↓ | p=1.000 |
+| `conciseness` | 0.80 | 0.91 | +0.11 ≈ | 4↑ 0↓ | p=0.125 |
+| `groundedness` | 0.43 | 0.63 | **+0.20 ▲** | 7↑ 0↓ | **p=0.016** |
 
-v2 is not measurably better. Conciseness trends the right way (3 rows fixed,
-none broken) but is underpowered — roughly 5–6 unanimous flips are needed for
-p<0.05 at n=33. Groundedness went slightly *backwards*: v2's "stay in the
-retrieved context" instruction fixed one row and broke two.
+Seven rows fixed and none broken is a real effect, and the paired test says so.
+Conciseness moved the same direction with 4↑ 0↓ and still can't be called —
+roughly 5–6 unanimous flips are needed for p<0.05 at this n, which is exactly
+the kind of "obvious" improvement that isn't yet evidence.
 
-Two runs over identical inputs gave conciseness +0.18 then +0.09, and
-groundedness 0.48→0.52 then 0.55→0.52. That swing is bigger than either
-"improvement", which is why step 08 tests significance (paired McNemar, since
-both variants answer the same inputs) rather than trusting a delta. An earlier
-version of this script counted any positive delta as a win, and duly declared
-victory on noise.
+Three tours have now produced groundedness 0.48→0.52, 0.55→0.52, and
+0.43→0.63. Those are *not* three runs of one experiment: each tour regenerates
+traffic in step 01 and rebuilds the dataset in step 07, so the inputs differ
+every time. The swing across them is wider than any single delta, which is why
+step 08 tests significance (paired McNemar, since both variants answer the same
+inputs) rather than trusting a delta. An earlier version of this script counted
+any positive delta as a win, and duly declared victory on noise.
 
-**Treat this as the tour working, not failing.** A POC that manufactures a green
-checkmark teaches nothing; the point of the evaluate/improve loop is that it
-tells you when you have *not* improved anything. To get a defensible win: widen
-the dataset (more traffic in step 01 → more graded failures in step 04 → more
-rows in step 07, which raises the detectable effect size), and rewrite v2's
-grounding section, since the measurement says the current wording doesn't work.
+**Two caveats that the tour itself hands you, and that a green checkmark would
+otherwise bury.**
+
+*The metric that improved is one step 06 says not to trust yet.* Judge-vs-human
+agreement came out at 35–50%, almost all of it the judge flagging answers the
+human didn't. Step 08 shows v2 scoring better under that judge; it does not
+show v2 hallucinating less. Aligning the judge is the prerequisite, and step 06
+prints exactly that warning.
+
+*Two judges disagree wildly on the same spans.* Step 04's offline Phoenix judge
+scores the 38 turns at mean 0.47; the AX-hosted online evaluator from step 05
+scores the very same spans at 0.11 — visible side by side in step 10's metrics
+table, since the case difference keeps them in separate columns. Same model,
+same spans, different template and harness. Whichever you wire a monitor to is
+the one that defines "groundedness" for your alerts.
+
+The dataset is also selected *on failures* (23 failing turns + 12 controls), so
+it deliberately over-samples the cases v2 targets. That is the right shape for
+detecting a fix and the wrong shape for estimating production groundedness.
+
+To harden the result: widen the dataset (more traffic in step 01 → more graded
+failures in step 04 → more rows in step 07, which raises the detectable effect
+size), and align the judge against human labels before treating its score as
+the thing you are optimising.
 
 Step 07 builds its dataset from step 04's **eval verdicts**, not step 03's
 heuristics. The heuristics are keyword-narrow — `check_ungrounded` only fires on
-refund phrasing and found 1 hallucination in 39 turns, where the judge grading
-every answer flagged ~21. Run step 04 before step 07 or you get the narrow set.
+refund phrasing and found 2 hallucinations in 38 turns, where the judge grading
+every answer flagged 20. Run step 04 before step 07 or you get the narrow set.
 
 ---
 
@@ -293,3 +312,20 @@ AGENT      copilot.turn
 Point `ARIZE_PROJECT_NAME` at a fresh project name in `.env` and re-run
 `make all` for a clean tour. `rm -rf .out` clears the local intermediates that
 scripts pass between each other.
+
+**Do not delete a project you intend to reuse the name of.** Deleting it and
+re-running the tour under the same name fails in the worst possible way: the
+collector still accepts every span and returns no error, ingestion recreates a
+project with that name and a new id, and the spans are never queryable. Both
+`spans.list()` and `export_to_df()` return nothing, indefinitely — so step 03
+reports "No spans returned" and the whole evaluate stage has nothing to stand
+on. Tracing the identical traffic to an unused name works within a minute,
+which is how you tell the two apart.
+
+So a reset is a rename, not a delete. The other objects — datasets,
+experiments, evaluators, tasks, prompts, annotation configs and queues — do
+delete cleanly and can be recreated under their original names.
+
+The one thing worth keeping across resets is the AI integration
+(`ARIZE_AI_INTEGRATION_ID`): recreating it means re-uploading your model
+provider key, and step 05 finds it by id.
