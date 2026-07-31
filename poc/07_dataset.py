@@ -106,6 +106,14 @@ def merge_eval_verdicts(turns):
 
 ANNOTATION_NAME = "human_groundedness"
 
+# Server-enforced ceiling on both update_examples and annotate_examples.
+BATCH_LIMIT = 1000
+
+
+def chunked(items: list, size: int):
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
+
 
 def existing_examples(client, space: str, name: str) -> dict[str, str]:
     """`source_span_id` -> example id, for the examples already in the dataset.
@@ -202,12 +210,17 @@ def promote_human_labels(client, settings, name: str, new_version: str) -> None:
         return
 
     console.print(f"\nFolding [bold]{len(updates)}[/bold] human verdicts back into the dataset…")
-    client.datasets.update_examples(
-        dataset=name,
-        space=space,
-        examples=updates,
-        **({"new_version": new_version} if new_version else {}),
-    )
+    # Both endpoints cap a request at 1000 records. This POC never gets close,
+    # but a tour run against real traffic would -- and the failure is a 4xx
+    # partway through, leaving the dataset half-updated with no record of where
+    # it stopped.
+    for batch in chunked(updates, BATCH_LIMIT):
+        client.datasets.update_examples(
+            dataset=name,
+            space=space,
+            examples=batch,
+            **({"new_version": new_version} if new_version else {}),
+        )
     reviewed = pd.Series([u["human_label"] for u in updates]).value_counts()
     console.print(
         f"[green]{len(updates)} examples[/green] now carry a reviewer verdict as a field "
@@ -215,7 +228,8 @@ def promote_human_labels(client, settings, name: str, new_version: str) -> None:
         + (f", written as dataset version [bold]{new_version}[/bold]." if new_version else ".")
     )
 
-    client.datasets.annotate_examples(dataset=name, space=space, annotations=annotations)
+    for batch in chunked(annotations, BATCH_LIMIT):
+        client.datasets.annotate_examples(dataset=name, space=space, annotations=batch)
     # The call is accepted and raises nothing, but the annotations do not come
     # back through `list_examples` -- checked repeatedly over several minutes.
     # Either the write is not landing or the read path does not surface it, and

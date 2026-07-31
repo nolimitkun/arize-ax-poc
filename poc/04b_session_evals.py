@@ -37,11 +37,26 @@ def build_transcripts(turns: pd.DataFrame) -> pd.DataFrame:
     an average weighted by length. One span per session keeps the mean a mean
     over sessions, and the span it lands on is the turn where the outcome was
     actually decided.
+
+    Turns are sorted by `start_time` rather than trusted in the order step 03
+    happened to write them. The export comes back chronologically today, but
+    nothing documents that -- and `spans.list()` is explicitly descending -- so
+    the wrong order would hand the judge a conversation read backwards and pin
+    the verdict to the opening turn instead of the closing one. Both failures
+    look like a plausible score.
     """
     rows = []
+    if "start_time" not in turns.columns:
+        console.print(
+            "[yellow]No `start_time` column — re-run poc/03_query_spans.py.[/yellow] "
+            "[dim]Falling back to the stored row order, which is not guaranteed "
+            "to be chronological.[/dim]"
+        )
     for session_id, group in turns.groupby("session_id", sort=False):
         if not str(session_id).strip():
             continue
+        if "start_time" in group.columns:
+            group = group.sort_values("start_time", kind="stable")
         ordered = group.reset_index(drop=True)
         lines = []
         for i, turn in ordered.iterrows():

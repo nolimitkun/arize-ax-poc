@@ -191,6 +191,23 @@ def grade(rows: pd.DataFrame, template: str, settings, model: str) -> pd.Series:
     )
 
 
+CONTEXT_HINTS = ("context", "document", "reference", "retriev", "source")
+
+
+def supplies_context(template: str) -> bool:
+    """Does this template actually hand the judge the source documents?
+
+    Placeholders only. Searching the prose for "retrieved" finds the hosted
+    template's own sentence about documentation it retrieved and concludes it
+    has the documents -- when its only two placeholders are `{input.value}` and
+    `{output.value}`, and it never sees them.
+    """
+    import re
+
+    placeholders = re.findall(r"\{([a-zA-Z0-9_.]+)\}", template)
+    return any(hint in name.lower() for name in placeholders for hint in CONTEXT_HINTS)
+
+
 def publish(client, settings, examples: list[dict[str, str]], commit: str) -> None:
     """Add the aligned template as a new version of the AX evaluator.
 
@@ -208,10 +225,34 @@ def publish(client, settings, examples: list[dict[str, str]], commit: str) -> No
     current = client.evaluators.get(evaluator=AX_EVALUATOR_NAME, space=settings.arize_space_name)
     config = current.version.template_config
 
+    # The two judges are not the same judge. The hosted template addresses
+    # `{input.value}` / `{output.value}` and has no placeholder for the
+    # retrieved documentation at all, so it grades groundedness without ever
+    # seeing the source -- which is why step 10 shows the offline judge at 0.47
+    # and this one at 0.11 on the identical spans. The worked examples transfer;
+    # the holdout number measured above does not, and saying so in the commit
+    # message is the difference between a record and a claim.
+    grades_blind = not supplies_context(config.template)
+    if grades_blind:
+        console.print(
+            "  [yellow]Note: the hosted template has no retrieved-context "
+            "placeholder[/yellow] [dim]— it grades without the source documents, so "
+            "the holdout agreement measured above does not describe it.[/dim]"
+        )
+
     client.evaluators.create_template_version(
         evaluator=AX_EVALUATOR_NAME,
         space=settings.arize_space_name,
-        commit_message=commit,
+        commit_message=(
+            commit
+            + (
+                "  Measured with the offline judge template, which sees the retrieved "
+                "documents this one does not -- indicative, not a measurement of this "
+                "evaluator."
+                if grades_blind
+                else ""
+            )
+        ),
         template_config=TemplateConfig(
             name=config.name,
             # escape=False: AX substitutes `{input.value}` itself, so doubling
@@ -357,9 +398,9 @@ def main(
                 settings,
                 examples,
                 commit=(
-                    f"Aligned to {len(examples)} human-reviewed cases; holdout agreement "
-                    f"{100 * base_ok.mean():.0f}% → {100 * aligned_ok.mean():.0f}% "
-                    f"on {n} rows (p={p:.3f})."
+                    f"Aligned to {len(examples)} human-reviewed cases mined in poc/06b. "
+                    f"Offline holdout agreement {100 * base_ok.mean():.0f}% → "
+                    f"{100 * aligned_ok.mean():.0f}% on {n} rows (p={p:.3f})."
                 ),
             )
             console.print("[green]Published a new version.[/green]")
@@ -374,8 +415,9 @@ def main(
         "cases in its template, and its commit message carries the measurement.",
         "Diff it against the previous version — the change is worked examples, not "
         "rewritten instructions. That is the whole technique.",
-        "The continuous task from step 05 picks the new version up automatically; "
-        "re-run poc/01_trace.py and the next spans are graded by the aligned judge.",
+        "Whether the continuous task from step 05 picks the new version up on its "
+        "own is worth confirming rather than assuming: re-run poc/01_trace.py and "
+        "check that the next spans were graded by the version you just published.",
     )
     done(
         "poc/07_dataset.py — build the dataset the experiment runs on",

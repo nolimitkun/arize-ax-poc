@@ -271,6 +271,9 @@ def check_judge_verdict_parsing() -> None:
         ("hallucinated\nInvented a 30-day window.", "hallucinated"),
         ("Verdict: grounded", "grounded"),
         ("**hallucinated**", "hallucinated"),
+        # Markdown emphasis with underscores. A `[a-z_]+` character class makes
+        # this one unknown token and scores a caught hallucination as an error.
+        ("__hallucinated__", "hallucinated"),
         ("GROUNDED.", "grounded"),
         # The bug: substring matching scored these as passes.
         ("ungrounded\nNo support for the refund claim.", "error"),
@@ -587,6 +590,25 @@ def check_judge_alignment() -> None:
     check("the result is tested, not just differenced", "mcnemar_p(" in source)
     check("too few discordant rows is called out rather than glossed over",
           "fixed + broken < 6" in source)
+    # The hosted template has no retrieved-context placeholder, so it grades
+    # groundedness blind. Attaching the offline judge's holdout number to that
+    # version's commit message would describe a judge that was never measured.
+    check("the published version doesn't borrow the offline judge's number",
+          "grades_blind" in source and "Offline holdout agreement" in source)
+    check("...and the discrepancy is surfaced when it applies",
+          "no retrieved-context" in source)
+
+    import importlib
+
+    module = importlib.import_module("06b_align_judge")
+    ax = importlib.import_module("05_online_evals")
+    # Detecting this from the prose finds the hosted template's own sentence
+    # about "documentation it retrieved" and concludes it has the documents,
+    # when its only placeholders are input.value and output.value.
+    check("the offline template is seen to supply context",
+          module.supplies_context(GROUNDEDNESS_TEMPLATE))
+    check("the hosted template is correctly seen NOT to",
+          not module.supplies_context(ax.GROUNDEDNESS_TEMPLATE))
 
 
 def check_session_evals() -> None:
@@ -601,17 +623,28 @@ def check_session_evals() -> None:
     turns = pd.DataFrame(
         [
             {"session_id": "s1", "span_id": "a", "question": "q1", "answer": "a1",
-             "tool_calls": "", "is_failure": False},
+             "tool_calls": "", "is_failure": False, "start_time": 1},
             {"session_id": "s1", "span_id": "b", "question": "q2", "answer": "a2",
-             "tool_calls": "escalate_ticket", "is_failure": False},
+             "tool_calls": "escalate_ticket", "is_failure": False, "start_time": 2},
             {"session_id": "s2", "span_id": "c", "question": "q3", "answer": "a3",
-             "tool_calls": "", "is_failure": True},
+             "tool_calls": "", "is_failure": True, "start_time": 3},
             {"session_id": "", "span_id": "d", "question": "q4", "answer": "a4",
-             "tool_calls": "", "is_failure": False},
+             "tool_calls": "", "is_failure": False, "start_time": 4},
         ]
     )
     built = module.build_transcripts(turns)
     check("one row per session, not per turn", len(built) == 2, f"got {len(built)}")
+
+    # Nothing documents the export as chronological, and `spans.list()` is
+    # explicitly descending. Fed the reverse order, an unsorted implementation
+    # hands the judge a backwards conversation and anchors the verdict on the
+    # opening turn -- both of which produce a plausible-looking score.
+    shuffled = module.build_transcripts(turns.iloc[::-1].reset_index(drop=True))
+    s1_shuffled = shuffled[shuffled["session_id"] == "s1"].iloc[0]
+    check("turn order survives a reversed input", s1_shuffled["span_id"] == "b",
+          s1_shuffled["span_id"])
+    check("...and so does the transcript",
+          s1_shuffled["transcript"].index("q1") < s1_shuffled["transcript"].index("q2"))
     check("spans with no session id are dropped", "" not in set(built["session_id"]))
     s1 = built[built["session_id"] == "s1"].iloc[0]
     check("the verdict hangs on the session's last span", s1["span_id"] == "b", s1["span_id"])
@@ -676,6 +709,9 @@ def check_span_metadata_enrichment() -> None:
     # finding rather than an absence.
     check('a clean turn is tagged "none", not empty', '.replace("", "none")' in source)
     check("it can be turned off without skipping the export", "skip_metadata" in source)
+    # Without this column step 04b cannot order a conversation at all.
+    check("start_time is carried through for the session judge",
+          '"start_time": find_col(' in source and '"start_time": span.get(' in source)
 
 
 def check_dataset_lifecycle() -> None:
@@ -694,6 +730,10 @@ def check_dataset_lifecycle() -> None:
           and "score=float(row.get" not in source)
     check("a failed merge exits non-zero instead of printing a summary",
           "merge_failed" in source)
+    # Both dataset endpoints cap a request at 1000 records, and blowing the cap
+    # 4xxs partway through, leaving the dataset half-updated.
+    check("dataset writes are batched under the server's 1000-record cap",
+          "BATCH_LIMIT = 1000" in source and source.count("chunked(") == 3)
 
 
 def check_experiment_arms() -> None:

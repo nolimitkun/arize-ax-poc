@@ -205,6 +205,12 @@ def main(
             agent_df, "attributes.copilot.prompt_version", "copilot.prompt_version"
         ),
         "session": find_col(agent_df, "attributes.session.id", "session.id"),
+        # Carried purely so step 04b can order a conversation. The export
+        # happens to come back chronologically today, but nothing documents
+        # that -- `spans.list()` is explicitly *descending* -- and a transcript
+        # assembled in the wrong order is read backwards by the judge with no
+        # sign that anything went wrong.
+        "start_time": find_col(agent_df, "start_time", "context.start_time"),
     }
     missing = [k for k, v in cols.items() if v is None]
     if missing:
@@ -247,6 +253,7 @@ def main(
                 "retrieved_doc_ids": ",".join(docs),
                 "expected_behavior": meta.get("expected_behavior", ""),
                 "expected_tools": ",".join(expected_tools),
+                "start_time": span.get(cols["start_time"], None) if cols["start_time"] else None,
                 "prompt_version": span.get(cols["version"], "") if cols["version"] else "",
                 "answer_words": len(answer.split()),
                 "failures": ",".join(failures),

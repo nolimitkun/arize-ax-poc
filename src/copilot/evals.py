@@ -93,7 +93,11 @@ def parse_verdict(text: str, choices: dict[str, float] | None = None) -> tuple[s
     scale = CHOICES if choices is None else choices
     lines = [line for line in text.strip().splitlines() if line.strip()]
     first = lines[0].lower() if lines else ""
-    tokens = [t for t in re.findall(r"[a-z_]+", first) if t not in _FILLER]
+    # Letters only. No label in use here contains an underscore, and including
+    # one in the character class makes `__hallucinated__` -- markdown emphasis a
+    # judge emits unprompted -- tokenise as a single unknown word and score as
+    # an error instead of a verdict.
+    tokens = [t for t in re.findall(r"[a-z]+", first) if t not in _FILLER]
     label = tokens[0] if tokens else ""
     if label not in scale:
         return (

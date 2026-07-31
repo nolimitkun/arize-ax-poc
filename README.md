@@ -202,11 +202,10 @@ human didn't. Step 08 shows v2 scoring better under that judge; it does not
 show v2 hallucinating less.
 
 Step 06b now attempts the fix rather than only naming it — and reports that it
-could not certify one. Few-shot alignment moved held-out agreement in the right
-direction (2 rows fixed, 0 broken) but nowhere near significance at this sample
-size. **The caveat stands.** What changed is that there is now a measurement
-saying so, on rows the alignment never saw, instead of an unexamined assumption
-in either direction.
+could not certify one. Across three runs few-shot alignment moved held-out
+agreement up, down and nowhere, never approaching significance. **The caveat
+stands.** What changed is that there is now a measurement saying so, on rows the
+alignment never saw, instead of an unexamined assumption in either direction.
 
 *Two judges disagree wildly on the same spans.* Step 04's offline Phoenix judge
 scores the 38 turns at mean 0.47; the AX-hosted online evaluator from step 05
@@ -248,25 +247,39 @@ of how it is wrong tends to lurch the other way; an earlier version did exactly
 that and made agreement *worse*.
 
 The honest result on this fixture: 38 labelled rows, 20 disagreements, a 19-row
-holdout. The aligned template fixed 2 rows and broke 0, moving agreement
-37% → 47%. **p=0.500 — not a result.** A two-sided exact test cannot reach
-p<0.05 with fewer than six discordant rows however lopsided they are, so the
-step says so rather than letting a green arrow imply otherwise. The binding
-constraint is the number of human labels, not the template.
+holdout — and **no consistent effect**. Three runs of the identical step over
+the identical labels gave +2/−0 (37% → 47%), +1/−1 (37% → 37%) and +0/−0
+(42% → 42%). Every one of them p ≥ 0.5.
 
-Worth knowing before reading too much into any single run: the *unaligned*
-judge's own agreement came out at 60%, 47% and 37% across three runs over the
-same spans. The judge's run-to-run variance is about the size of the effect
-being measured. That is the argument for a held-out significance test rather
-than a before/after number, in one observation.
+A two-sided exact test cannot reach p<0.05 with fewer than six discordant rows
+however lopsided they are, so the step says so rather than letting a green arrow
+imply otherwise. The binding constraint is the number of human labels, not the
+template.
+
+Note what the *unaligned* judge did across those same three runs, over the same
+spans and the same labels: 37%, 37%, 42% — and 47% and 60% on two earlier ones.
+**The judge's run-to-run variance is larger than the effect being measured.**
+That single observation is the whole argument for a held-out significance test
+instead of a before/after number, and it is why quoting the run that looked best
+would have been the easiest mistake in this repo to make. The first draft of
+this section did exactly that.
 
 It also publishes the aligned template as a new version of the AX `Groundedness`
-evaluator, with the measurement in the commit message. The hosted template is
-*not* the local one — it addresses `{input.value}` rather than named
-placeholders — so the examples are spliced into whatever AX currently holds,
-read back from the platform. That carries forward any edit made in the UI, and
-means the braces must not be escaped on that path even though they must be on
-the local one.
+evaluator. The hosted template is *not* the local one — it addresses
+`{input.value}` rather than named placeholders — so the examples are spliced
+into whatever AX currently holds, read back from the platform. That carries
+forward any edit made in the UI, and means the braces must not be escaped on
+that path even though they must be on the local one.
+
+More importantly, **the hosted template has no placeholder for the retrieved
+documents at all**: its only two are `{input.value}` and `{output.value}`, so it
+grades groundedness without ever seeing the source. That is almost certainly why
+step 10 shows the offline judge at 0.47 and this one at 0.11 on identical spans.
+The worked examples transfer between them; the holdout number does not, and the
+commit message says so rather than implying the published version was the thing
+measured. Detecting this needs the placeholder list, not the prose — the hosted
+template contains the phrase "documentation it retrieved", which is what a
+keyword check finds just before drawing the opposite conclusion.
 
 ### 04b — grading conversations instead of turns
 

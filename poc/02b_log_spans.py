@@ -240,15 +240,23 @@ def main(
     )
     console.print(f"[green]Accepted[/green] (HTTP {getattr(response, 'status_code', '?')}).")
 
+    # Joined on span id rather than zipped positionally. The two frames happen
+    # to be built in the same order today, which is exactly the kind of implicit
+    # invariant that later mislabels every row in silence.
+    summary = (
+        spans_df[spans_df[SPAN_KIND] == "AGENT"]
+        .merge(evals_df, on="context.span_id")
+    )
     table(
         "Backfilled",
         ["trace", "question", "groundedness"],
         [
-            [row["context.trace_id"][:12], row["attributes.input.value"][:48], label]
-            for (_, row), label in zip(
-                spans_df[spans_df[SPAN_KIND] == "AGENT"].iterrows(),
-                evals_df["eval.groundedness.label"],
-            )
+            [
+                row["context.trace_id"][:12],
+                row["attributes.input.value"][:48],
+                row["eval.groundedness.label"],
+            ]
+            for _, row in summary.iterrows()
         ],
     )
 
