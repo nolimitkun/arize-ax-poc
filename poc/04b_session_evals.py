@@ -11,6 +11,12 @@ AX already groups turns into sessions (poc/01 sets `session.id` on every span).
 This step evaluates that grouping: rebuild each transcript, judge the outcome,
 and write the verdict back so sessions become filterable by how they ended.
 
+Its headline -- sessions that failed as a whole while every turn in them passed
+-- is only worth anything if "passed" means passed everything. So the turn-level
+verdict here is step 03's heuristics *and* step 04's evaluators combined, not
+the heuristics alone: those flag 10 turns where the evaluators flag 38, and
+using them by themselves would count sessions the judge had already condemned.
+
 Docs: https://arize.com/docs/ax/observe/tracing/sessions-and-users
       https://arize.com/docs/ax/evaluate/run-evals-on-traces
 """
@@ -25,6 +31,53 @@ from _common import arize_client, console, done, header, load, look_at, save, ta
 app = typer.Typer(add_completion=False)
 
 SESSION_EVAL = "session_outcome"
+
+
+def with_turn_verdicts(turns: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """Add `turn_failed`: did anything at all flag this turn?
+
+    Step 03's `is_failure` alone is far too narrow for the claim this step
+    makes. Those are keyword heuristics -- `check_ungrounded` only fires on
+    refund phrasing -- and on current traffic they flag 10 turns while step 04's
+    evaluators flag 38. Counting a session as "no turn-level failure" on the
+    heuristics alone therefore counts sessions the judge had already condemned,
+    which inflates the one number this step exists to report.
+
+    So a turn counts as failing if *either* signal fires. That is the strictest
+    reading available, and it is the one the headline needs: a silent session is
+    one nothing we have caught, not one the narrowest check missed.
+    """
+    from copilot.evals import TURN_FAILURE_EVALS
+
+    merged = turns.copy()
+    merged["turn_failed"] = merged["is_failure"].astype(bool)
+    sources = ["step 03 heuristics"]
+
+    try:
+        evals = load("04_evals.parquet")
+    except SystemExit:
+        console.print(
+            "[yellow]No 04_evals.parquet — falling back to step 03's heuristics "
+            "alone.[/yellow] [dim]They flag a fraction of what the evaluators do, so "
+            "the silent-session count below would be overstated. Run "
+            "poc/04_offline_evals.py first.[/dim]\n"
+        )
+        return merged, sources
+
+    score_cols = [c for c in TURN_FAILURE_EVALS if c in evals.columns]
+    if not score_cols:
+        console.print("[yellow]04_evals.parquet carries no score columns.[/yellow]\n")
+        return merged, sources
+
+    verdicts = evals[["context.span_id", *score_cols]].drop_duplicates("context.span_id")
+    merged = merged.merge(
+        verdicts, left_on=merged["span_id"].astype(str), right_on="context.span_id", how="left"
+    )
+    # NaN means the evaluator never graded this turn, which is not evidence of a
+    # failure -- `< 1.0` is False for NaN, so those rows fall through untouched.
+    merged["turn_failed"] = merged["turn_failed"] | (merged[score_cols] < 1.0).any(axis=1)
+    sources.append(f"step 04 evals ({len(score_cols)} evaluators)")
+    return merged, sources
 
 
 def build_transcripts(turns: pd.DataFrame) -> pd.DataFrame:
@@ -78,7 +131,7 @@ def build_transcripts(turns: pd.DataFrame) -> pd.DataFrame:
                 "escalated": "escalate_ticket" in ",".join(
                     str(t) for t in ordered["tool_calls"].fillna("")
                 ),
-                "turn_failures": int(ordered["is_failure"].sum()),
+                "turn_failures": int(ordered["turn_failed"].sum()),
             }
         )
     return pd.DataFrame(rows)
@@ -98,7 +151,7 @@ def main(
 
     from copilot.evals import SESSION_CHOICES, judge_session
 
-    turns = load("03_turns.parquet")
+    turns, verdict_sources = with_turn_verdicts(load("03_turns.parquet"))
     sessions = build_transcripts(turns)
     if sessions.empty:
         console.print(
@@ -144,10 +197,30 @@ def main(
     # The point of the whole step, stated as a number: sessions that failed as a
     # whole while every turn in them passed the turn-level checks.
     silent = graded[(graded["score"] < 1.0) & (graded["turn_failures"] == 0)]
+    flagged_rate = float(turns["turn_failed"].mean()) if len(turns) else 0.0
     console.print(
         f"\n[bold]{len(silent)}[/bold] session(s) ended badly with "
-        f"[bold]no turn-level failure[/bold] in them — invisible to step 04.\n"
+        f"[bold]no turn-level failure[/bold] in them — invisible to every "
+        f"per-turn evaluator in this tour.\n"
+        f"[dim]'No turn-level failure' means clean under "
+        f"{' and '.join(verdict_sources)}.[/dim]"
     )
+
+    # A bare zero here reads as good news, and on this fixture it is the
+    # opposite. When the turn-level evaluators flag almost every turn, no
+    # session can possibly be clean, so the count is pinned at zero by the
+    # noise floor rather than by an absence of silent failures. The metric
+    # stops discriminating before it stops printing.
+    if flagged_rate > 0.8:
+        console.print(
+            f"\n[yellow]Read that zero with care.[/yellow] The turn-level signals "
+            f"flag [bold]{100 * flagged_rate:.0f}%[/bold] of all turns, so almost no "
+            "session could come out clean whatever happened in it. This number cannot "
+            "discriminate until the judge does — see poc/06b, which measures that same "
+            "judge agreeing with humans well under half the time.\n"
+        )
+    else:
+        console.print()
     for _, row in silent.head(3).iterrows():
         console.print(f"  [yellow]{row['label']}[/yellow]  {row['session_id']} "
                       f"({row['turns']} turns)")

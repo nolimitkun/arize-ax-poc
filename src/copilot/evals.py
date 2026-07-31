@@ -50,6 +50,19 @@ even if it sounds reasonable. Inventing a refund window is hallucination.
 
 CHOICES: dict[str, float] = {"grounded": 1.0, "hallucinated": 0.0}
 
+# The score columns step 04 writes, and the failure each one represents. One
+# definition, because "did this turn fail?" is asked in three places -- poc/04b
+# deciding whether a bad session was silent, poc/07 selecting dataset rows, and
+# poc/03's heuristics, which answer a deliberately narrower question. A score
+# below 1.0 is a failure for all of them; NaN means never graded, which is not
+# evidence of anything.
+TURN_FAILURE_EVALS: dict[str, str] = {
+    "eval.groundedness.score": "hallucination",
+    "eval.conciseness.score": "verbosity",
+    "eval.tool_selection.score": "wrong_tool",
+    "eval.escalation_appropriate.score": "missing_escalation",
+}
+
 CHOICE_DESCRIPTIONS: dict[str, tuple[float, str]] = {
     "grounded": (
         1.0,

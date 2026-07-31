@@ -288,9 +288,24 @@ does and what most eval tooling misses. A conversation can be made of turns that
 are each individually correct — grounded, concise, right tool — and still fail:
 the customer asks three times, gets three accurate non-answers, and leaves.
 
-On the current traffic: 14 sessions, 38 turns. Six came back `unresolved`, and
-**two of those contained no turn-level failure at all** — invisible to step 04
-by construction. That number is the reason the step exists.
+On the current traffic: 15 sessions, 39 turns — 7 `unresolved`, 1 `frustrated`,
+7 `resolved`. Nearly half of these conversations ended without the customer
+getting what they came for, which no turn-level average was going to tell you.
+
+The count of sessions that failed *while every turn in them passed* is **zero**,
+and that number is worth more than the one it replaced. An earlier version of
+this step scored "every turn passed" against step 03's keyword heuristics alone
+and reported two such sessions. Those heuristics flag 10 turns out of 39 where
+step 04's evaluators flag 38, so it was clearing sessions the judge had already
+condemned. Scored against both signals, as it is now, nothing is clean —
+**because the evaluators flag 100% of turns**, which pins the metric at zero
+regardless of what happened in any conversation.
+
+So the step prints the zero and then says not to read it as good news: the
+measure cannot discriminate until the judge does, and poc/06b is the measurement
+showing that same judge agreeing with humans well under half the time. A silent
+session is still the failure worth hunting; this fixture just cannot currently
+see one.
 
 The verdict is written to the session's *last* span, not to every span in it.
 Writing it to all of them would make the mean depend on how many turns each

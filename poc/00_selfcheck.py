@@ -614,9 +614,10 @@ def check_judge_alignment() -> None:
 def check_session_evals() -> None:
     """A session score written to every span silently weights by conversation length."""
     console.print("\n[bold]Session-level evaluation (step 04b)[/bold]")
-    import pandas as pd
-
     import importlib
+    from pathlib import Path
+
+    import pandas as pd
 
     module = importlib.import_module("04b_session_evals")
 
@@ -632,6 +633,7 @@ def check_session_evals() -> None:
              "tool_calls": "", "is_failure": False, "start_time": 4},
         ]
     )
+    turns["turn_failed"] = turns["is_failure"]
     built = module.build_transcripts(turns)
     check("one row per session, not per turn", len(built) == 2, f"got {len(built)}")
 
@@ -653,6 +655,34 @@ def check_session_evals() -> None:
     check("escalation is detected across the session", bool(s1["escalated"]))
     check("turn-level failures are carried through for the comparison",
           int(built[built["session_id"] == "s2"].iloc[0]["turn_failures"]) == 1)
+
+    # The headline claim -- "failed as a whole, no turn-level failure" -- is only
+    # meaningful if it clears every turn-level signal. Step 03's heuristics flag
+    # 10 turns on current traffic where step 04's evaluators flag 38, so scoring
+    # it on the heuristics alone counts sessions the judge already condemned.
+    source = Path(__file__).with_name("04b_session_evals.py").read_text()
+    check("the silent-session count consults step 04's verdicts too",
+          "TURN_FAILURE_EVALS" in source and "04_evals.parquet" in source)
+    check("...and reports which signals it cleared",
+          "verdict_sources" in source)
+    check("a turn is counted failed if either signal fires",
+          'merged["turn_failed"] | (merged[score_cols] < 1.0)' in source)
+
+    graded = pd.DataFrame(
+        [
+            # Heuristic-clean, but the judge flagged it: must not read as silent.
+            {"span_id": "a", "is_failure": False, "eval.groundedness.score": 0.0},
+            {"span_id": "b", "is_failure": False, "eval.groundedness.score": 1.0},
+        ]
+    )
+    graded["context.span_id"] = graded["span_id"]
+    combined = graded["is_failure"] | (graded[["eval.groundedness.score"]] < 1.0).any(axis=1)
+    check("an eval-flagged, heuristic-clean turn counts as a failure",
+          bool(combined.iloc[0]) and not bool(combined.iloc[1]))
+    # NaN means never graded, which is not evidence of a failure.
+    ungraded = pd.DataFrame([{"eval.groundedness.score": float("nan")}])
+    check("an ungraded turn is not counted as a failure",
+          not bool((ungraded[["eval.groundedness.score"]] < 1.0).any(axis=1).iloc[0]))
 
     from copilot.evals import SESSION_CHOICES, parse_verdict
 
@@ -751,6 +781,13 @@ def check_experiment_arms() -> None:
           "candidate,\n            )" in source or "reference" in source)
     check("both arms go through the same paired test",
           source.count("compare(reference, label") == 1 and "def compare(" in source)
+    # COPILOT_AGENT_MODEL can point the baseline arms at flash, in which case a
+    # flash comparison arm changes nothing and presents run-to-run noise as a
+    # model difference.
+    check("an arm that wouldn't change the model is skipped",
+          "compare_model == AGENT_MODEL" in source)
+    check("...and says why rather than silently dropping it",
+          "Skipping the model arm" in source)
 
     from copilot.agent import run_turn
 

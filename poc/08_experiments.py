@@ -374,7 +374,8 @@ def main(
     ),
     compare_model: str = typer.Option(
         "deepseek-v4-flash",
-        help="Third arm: the candidate prompt on this model ('' to skip)",
+        help="Third arm: the candidate prompt on this model "
+        "('' to skip; ignored if it equals the agent model)",
     ),
 ) -> None:
     settings = header(
@@ -409,7 +410,19 @@ def main(
         (baseline, baseline, None, None),
         (candidate, candidate, None, baseline),
     ]
-    if compare_model:
+    if compare_model and compare_model == AGENT_MODEL:
+        # The baseline arms already run AGENT_MODEL, which COPILOT_AGENT_MODEL
+        # can point anywhere. Adding an arm that names the same model would run
+        # the identical prompt on the identical model and then present the two
+        # runs' stochastic difference under the heading "v2 vs v2-flash" -- a
+        # model comparison in which the model never changed.
+        console.print(
+            f"\n[yellow]Skipping the model arm:[/yellow] --compare-model is "
+            f"{compare_model}, which is already the agent model. "
+            "[dim]Set COPILOT_AGENT_MODEL or --compare-model to something else "
+            "for the comparison to vary anything.[/dim]"
+        )
+    elif compare_model:
         # The label becomes an experiment name, so it stays in the same
         # [a-z0-9-] shape as the other arms rather than carrying an `@`.
         arms.append(

@@ -37,13 +37,9 @@ app = typer.Typer(add_completion=False)
 DATASET_NAME = "copilot-failures"
 
 # All eval columns, mapped to the failure they represent. Score < 1.0 is a
-# failure for each (they are all maximize-direction).
-FAILING_EVALS = {
-    "eval.groundedness.score": "hallucination",
-    "eval.conciseness.score": "verbosity",
-    "eval.tool_selection.score": "wrong_tool",
-    "eval.escalation_appropriate.score": "missing_escalation",
-}
+# failure for each (they are all maximize-direction). Shared with poc/04b, which
+# has to ask the same question about the same turns.
+from copilot.evals import TURN_FAILURE_EVALS as FAILING_EVALS  # noqa: E402
 
 # ...but only these two decide whether a turn is *selected* into the dataset,
 # because they are what step 08 re-measures. Selecting on tool_selection too
