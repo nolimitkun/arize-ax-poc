@@ -28,7 +28,7 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 import typer
 
-from _common import arize_client, console, done, header, look_at, table
+from _common import arize_client, console, done, header, look_at, require_arize, table
 
 app = typer.Typer(add_completion=False)
 
@@ -221,6 +221,7 @@ def main(
         "Instrument: log spans directly, without OpenTelemetry",
         "spans client resource · view-and-manage-traces",
     )
+    require_arize(settings, "the spans log client")
 
     target = project or f"{settings.arize_project_name}-backfill"
     spans_df, evals_df = build_history(HISTORIC_TICKETS, days_back)

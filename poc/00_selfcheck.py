@@ -998,6 +998,183 @@ def check_region_wiring() -> None:
         )
 
 
+def check_observability() -> None:
+    """COPILOT_OBSERVABILITY fans the same spans out to Arize and/or LangSmith.
+
+    The trap this guards: a mode that silently demands credentials it doesn't
+    use (or skips ones it does), and Arize-platform steps crashing instead of
+    stepping aside when Arize is disabled. All offline.
+    """
+    console.print("\n[bold]Observability backends (COPILOT_OBSERVABILITY)[/bold]")
+    import os
+
+    from _common import require_arize
+
+    from copilot.config import ConfigError, Settings, load_settings
+    from copilot.tracing import _langsmith_processor
+
+    env_keys = (
+        "ARIZE_API_KEY", "ARIZE_SPACE_ID", "ARIZE_SPACE_NAME", "DEEPSEEK_API_KEY",
+        "ARIZE_PROJECT_NAME", "LANGSMITH_API_KEY", "LANGSMITH_PROJECT",
+        "LANGSMITH_ENDPOINT", "COPILOT_OBSERVABILITY", "COPILOT_IMPL",
+    )
+    saved = {k: os.environ.get(k) for k in env_keys}
+
+    def load_with(**env: str):
+        for key in env_keys:
+            os.environ.pop(key, None)
+        os.environ.update(env)
+        return load_settings()
+
+    try:
+        try:
+            load_with(COPILOT_OBSERVABILITY="phoenix", DEEPSEEK_API_KEY="x")
+            check("an unknown mode is rejected", False)
+        except ConfigError as exc:
+            check("an unknown mode is rejected", "phoenix" in str(exc), str(exc))
+
+        try:
+            load_with(COPILOT_OBSERVABILITY="langsmith", DEEPSEEK_API_KEY="x")
+            check("langsmith mode still requires LANGSMITH_API_KEY", False)
+        except ConfigError as exc:
+            check(
+                "langsmith mode still requires LANGSMITH_API_KEY",
+                "LANGSMITH_API_KEY" in str(exc) and "ARIZE_API_KEY" not in str(exc),
+                str(exc),
+            )
+
+        # LangSmith-only: no Arize credentials needed at all.
+        ls = load_with(
+            COPILOT_OBSERVABILITY="langsmith", DEEPSEEK_API_KEY="x",
+            LANGSMITH_API_KEY="x", ARIZE_PROJECT_NAME="proj",
+        )
+        check(
+            "langsmith mode loads without any ARIZE_* variables",
+            not ls.arize_enabled and ls.langsmith_enabled and ls.arize_api_key == "",
+        )
+        check(
+            "...and the LangSmith project inherits the trace project name",
+            ls.langsmith_project == "proj",
+            ls.langsmith_project,
+        )
+
+        lg = load_with(
+            COPILOT_OBSERVABILITY="langsmith", COPILOT_IMPL="langgraph",
+            DEEPSEEK_API_KEY="x", LANGSMITH_API_KEY="x", ARIZE_PROJECT_NAME="proj",
+        )
+        check(
+            "...including the LangGraph engine's -lg suffix",
+            lg.langsmith_project == "proj-lg",
+            lg.langsmith_project,
+        )
+
+        try:
+            load_with(COPILOT_OBSERVABILITY="both", DEEPSEEK_API_KEY="x")
+            check("both mode requires both platforms' keys", False)
+        except ConfigError as exc:
+            check(
+                "both mode requires both platforms' keys",
+                "LANGSMITH_API_KEY" in str(exc) and "ARIZE_API_KEY" in str(exc),
+                str(exc),
+            )
+
+        # Default: exactly today's behaviour, no LangSmith anywhere.
+        default = load_with(
+            DEEPSEEK_API_KEY="x", ARIZE_API_KEY="x", ARIZE_SPACE_ID="x", ARIZE_SPACE_NAME="x",
+        )
+        check(
+            "the default is arize-only (unchanged behaviour)",
+            default.observability == "arize" and default.arize_enabled and not default.langsmith_enabled,
+        )
+
+        eu = load_with(
+            COPILOT_OBSERVABILITY="langsmith", DEEPSEEK_API_KEY="x", LANGSMITH_API_KEY="x",
+            LANGSMITH_ENDPOINT="https://eu.api.smith.langchain.com",
+        )
+        check(
+            "LANGSMITH_ENDPOINT (EU) derives the EU OTLP ingestion URL",
+            eu.langsmith_otlp_endpoint == "https://eu.api.smith.langchain.com/otel/v1/traces",
+            eu.langsmith_otlp_endpoint,
+        )
+    finally:
+        for key, value in saved.items():
+            os.environ.pop(key, None)
+            if value is not None:
+                os.environ[key] = value
+
+    # The exporter lane itself: right URL, key and project travel as headers.
+    dummy = Settings(
+        arize_api_key="", arize_space_id="", arize_space_name="",
+        arize_project_name="proj", arize_region=None, arize_otlp_endpoint="x",
+        deepseek_api_key="x", deepseek_base_url="x",
+        arize_ai_integration_id=None, prompt_version="v1", impl="sdk",
+        observability="langsmith", langsmith_api_key="ls-key", langsmith_project="proj",
+    )
+    processor = _langsmith_processor(dummy, "proj")
+    exporter = processor.span_exporter
+    headers = dict(getattr(exporter, "_headers", None) or {})
+    check(
+        "the LangSmith span processor targets the OTLP ingestion endpoint",
+        getattr(exporter, "_endpoint", "").endswith("/otel/v1/traces"),
+        str(getattr(exporter, "_endpoint", None)),
+    )
+    check(
+        "...authenticating by x-api-key, project by header",
+        headers.get("x-api-key") == "ls-key" and headers.get("Langsmith-Project") == "proj",
+        str(headers),
+    )
+
+    # The trap in `both` mode: Arize's TracerProvider treats its own exporter
+    # as a "default" processor and add_span_processor() *removes* it -- which
+    # would silently turn `both` into langsmith-only. The LangSmith lane must
+    # therefore ride in through register(span_processors=[...]). Assert both
+    # the SDK contract and that tracing.py actually uses it.
+    from pathlib import Path
+
+    from arize.otel import register
+
+    provider = register(
+        space_id="x", api_key="x", project_name="proj",
+        set_global_tracer_provider=False, verbose=False,
+        span_processors=[_langsmith_processor(dummy, "proj")],
+    )
+    lanes = provider._active_span_processor._span_processors
+    check(
+        "register(span_processors=...) keeps both exporter lanes",
+        len(lanes) == 2,
+        f"{len(lanes)} lane(s): {[type(p).__name__ for p in lanes]}",
+    )
+    clobbered = provider._default_processor
+    provider.shutdown()
+    check("...and neither is a clobber-on-add default", not clobbered)
+    tracing_source = (Path(__file__).parent.parent / "src" / "copilot" / "tracing.py").read_text()
+    check(
+        "init_tracing hands the LangSmith lane to register(span_processors=)",
+        "span_processors=" in tracing_source,
+    )
+
+    # Arize-platform steps step aside rather than crash when Arize is off.
+    # (capture() swallows the guard's own "Skipped:" banner.)
+    try:
+        with console.capture():
+            require_arize(dummy, "selfcheck")
+        skipped = None
+    except SystemExit as exc:
+        skipped = exc.code
+    check("require_arize skips (exit 0) when Arize is disabled", skipped == 0, f"exit={skipped}")
+    arize_only = Settings(
+        arize_api_key="x", arize_space_id="x", arize_space_name="x",
+        arize_project_name="proj", arize_region=None, arize_otlp_endpoint="x",
+        deepseek_api_key="x", deepseek_base_url="x",
+        arize_ai_integration_id=None, prompt_version="v1",
+    )
+    try:
+        require_arize(arize_only, "selfcheck")
+        check("require_arize lets the default mode straight through", True)
+    except SystemExit:
+        check("require_arize lets the default mode straight through", False)
+
+
 def check_langgraph_engine() -> None:
     """The second engine: same logic through LangGraph/LangChain.
 
@@ -1213,6 +1390,7 @@ def main() -> None:
     check_dataframe_contracts()
     check_targets_ax_not_phoenix()
     check_region_wiring()
+    check_observability()
     check_langgraph_engine()
     check_sdk_surface()
 

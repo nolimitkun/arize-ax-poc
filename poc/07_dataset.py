@@ -30,7 +30,7 @@ from __future__ import annotations
 import pandas as pd
 import typer
 
-from _common import arize_client, console, done, header, load, look_at, save, table
+from _common import arize_client, console, done, header, load, look_at, require_arize, save, table
 
 app = typer.Typer(add_completion=False)
 
@@ -258,6 +258,7 @@ def main(
         "Improve: build a dataset from the failing traces",
         "build-a-dataset",
     )
+    require_arize(settings, "datasets")
 
     from copilot.agent import load_questions
 

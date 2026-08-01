@@ -28,7 +28,7 @@ from typing import Any
 
 import typer
 
-from _common import console, done, header, look_at, mcnemar_p, table
+from _common import console, done, header, look_at, mcnemar_p, require_arize, table
 
 app = typer.Typer(add_completion=False)
 
@@ -383,6 +383,7 @@ def main(
         "Improve: prompt and model variants against one baseline",
         "set-up-an-experiment · experiment-in-code · run-evals-on-experiments",
     )
+    require_arize(settings, "experiments")
 
     from _common import arize_client
     from copilot.config import AGENT_MODEL

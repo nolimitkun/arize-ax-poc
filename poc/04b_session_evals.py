@@ -26,7 +26,7 @@ from __future__ import annotations
 import pandas as pd
 import typer
 
-from _common import arize_client, console, done, header, load, look_at, save, table
+from _common import arize_client, console, done, header, load, look_at, require_arize, save, table
 
 app = typer.Typer(add_completion=False)
 
@@ -148,6 +148,7 @@ def main(
         "Evaluate: session-level outcomes over whole conversations",
         "sessions-and-users · run-evals-on-traces",
     )
+    require_arize(settings, "session-level span export")
 
     from copilot.evals import SESSION_CHOICES, judge_session
 

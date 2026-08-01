@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 import pandas as pd
 import typer
 
-from _common import arize_client, console, done, header, load, look_at, save, table, window
+from _common import arize_client, console, done, header, load, look_at, require_arize, save, table, window
 
 app = typer.Typer(add_completion=False)
 
@@ -139,6 +139,7 @@ def main(
         "Evaluate: human review queue, labels, and judge agreement",
         "human-review · labeling-queues · align-evals-to-human-feedback",
     )
+    require_arize(settings, "annotation queues")
 
     from arize.annotation_configs.types import (
         CategoricalAnnotationValue,

@@ -533,6 +533,39 @@ sends it back, and DeepSeek 400s a tool loop without it. `graph_agent.py`
 subclasses the model to echo the CoT on tool-calling assistant messages —
 `make check` asserts the echo offline.
 
+## Second backend: LangSmith
+
+Orthogonal to the engine choice, `COPILOT_OBSERVABILITY` picks where the traces
+go:
+
+```bash
+COPILOT_OBSERVABILITY=both make trace        # same spans, Arize and LangSmith at once
+COPILOT_OBSERVABILITY=langsmith make all     # LangSmith only; no Arize credentials needed
+```
+
+This is a fan-out, not a second tracing system. Both engines already emit one
+OpenTelemetry span set — the manual `copilot.turn`/TOOL spans plus the
+auto-instrumented LLM spans — so the backend decision is just which span
+processors sit on the one tracer provider. `arize` (the default) is exactly the
+old path; `both` adds a second OTLP lane into LangSmith's ingestion endpoint
+(authenticated by `x-api-key`, project named by the `Langsmith-Project` header,
+defaulting to the trace project name, `-lg` suffix included); `langsmith` skips
+the Arize wiring entirely. Tokens are counted once in every mode because the
+spans exist once. The deliberately *not* chosen alternative — LangSmith-native
+tracing via `LANGSMITH_TRACING` + callbacks — would only cover the LangGraph
+engine and would run parallel to OTel, splitting the trace tree between two
+systems.
+
+The honest caveat: tracing is the only part of this POC that is
+platform-portable. Steps 02b–10 drive Arize *platform* APIs — span export,
+evaluators, annotation queues, datasets, experiments, prompt hub, monitors —
+and have no LangSmith counterpart here. Under `langsmith`-only they print a
+skip banner and exit 0, so `make all` still completes: 01–02 trace to
+LangSmith, the rest step aside. Credentials follow the same logic — a
+LangSmith-only run needs no `ARIZE_*` variables at all, and vice versa
+(`LANGSMITH_API_KEY`, from smith.langchain.com → Settings → API Keys; EU orgs
+also set `LANGSMITH_ENDPOINT=https://eu.api.smith.langchain.com`).
+
 ## Notes on the build
 
 - **Model**: `deepseek-v4-pro` for the agent and the judges, `deepseek-v4-flash`

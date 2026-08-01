@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import typer
 
-from _common import arize_client, console, done, header, look_at, table
+from _common import arize_client, console, done, header, look_at, require_arize, table
 
 app = typer.Typer(add_completion=False)
 
@@ -75,6 +75,7 @@ def main(
         "Improve: publish to Prompt Hub, label, and load at runtime",
         "build-a-prompt · prompt-hub · versioning-and-tags · loading-in-applications",
     )
+    require_arize(settings, "the Prompt Hub")
 
     from arize.prompts.types import InputVariableFormat, LLMMessage, LlmProvider, MessageRole
 

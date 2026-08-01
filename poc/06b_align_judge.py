@@ -36,6 +36,7 @@ from _common import (
     load,
     look_at,
     mcnemar_p,
+    require_arize,
     save,
     table,
 )
@@ -280,6 +281,7 @@ def main(
         "Evaluate: align the judge to human labels, and prove it on held-out rows",
         "align-evals-to-human-feedback · create-evaluators",
     )
+    require_arize(settings, "evaluator alignment")
 
     from copilot.evals import GROUNDEDNESS_TEMPLATE, build_aligned_template
 

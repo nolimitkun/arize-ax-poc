@@ -23,7 +23,7 @@ from typing import Any
 import pandas as pd
 import typer
 
-from _common import arize_client, console, done, header, look_at, save, table, window
+from _common import arize_client, console, done, header, look_at, require_arize, save, table, window
 
 app = typer.Typer(add_completion=False)
 
@@ -155,6 +155,7 @@ def main(
         "Observe: export spans, find the failing traces",
         "view-and-manage-traces · spans client resource",
     )
+    require_arize(settings, "span export")
 
     client = arize_client(settings)
     start, end = window(hours)

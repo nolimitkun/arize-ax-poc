@@ -32,11 +32,35 @@ def header(step: str, title: str, docs: str) -> Settings:
         )
     )
     settings = settings_or_exit()
-    console.print(
-        f"[dim]space={settings.arize_space_name}  project={settings.arize_project_name}  "
-        f"region={settings.arize_region or 'default (US)'}[/dim]\n"
-    )
+    where = []
+    if settings.arize_enabled:
+        where.append(
+            f"space={settings.arize_space_name}  project={settings.arize_project_name}  "
+            f"region={settings.arize_region or 'default (US)'}"
+        )
+    if settings.langsmith_enabled:
+        where.append(f"langsmith={settings.langsmith_project}")
+    console.print(f"[dim]{'  '.join(where)}  obs={settings.observability}[/dim]\n")
     return settings
+
+
+def require_arize(settings: Settings, what: str) -> None:
+    """Exit cleanly when a step needs the Arize platform and it is disabled.
+
+    Steps 02b-10 drive Arize platform APIs -- span export, evaluators,
+    annotation queues, datasets, experiments, prompt hub, monitors -- which
+    have no LangSmith counterpart in this repo. Under
+    COPILOT_OBSERVABILITY=langsmith they skip with exit 0, so `make all`
+    still completes: 01-02 trace to LangSmith and the rest step aside.
+    """
+    if settings.arize_enabled:
+        return
+    console.print(
+        f"[yellow]Skipped:[/yellow] this step drives Arize platform APIs ({what}), "
+        "which COPILOT_OBSERVABILITY=langsmith disables.\n"
+        "[dim]Re-run with COPILOT_OBSERVABILITY=arize (or both) to include it.[/dim]\n"
+    )
+    raise SystemExit(0)
 
 
 def arize_client(settings: Settings):

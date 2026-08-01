@@ -19,7 +19,9 @@ help:
 	@echo ""
 	@echo "  Lettered steps (02b, 04b, 06b) are side paths off the step they follow."
 	@echo ""
-	@echo "  COPILOT_IMPL=langgraph make all   Same tour, LangGraph engine, own -lg project"
+	@echo "  COPILOT_IMPL=langgraph make all          Same tour, LangGraph engine, own -lg project"
+	@echo "  COPILOT_OBSERVABILITY=both make trace    Same spans to Arize and LangSmith at once"
+	@echo "  COPILOT_OBSERVABILITY=langsmith make all Traces to LangSmith only; 02b-10 skip"
 
 install:
 	uv sync
