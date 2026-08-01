@@ -407,12 +407,14 @@ def main(
     created.append(("code", "EscalationAppropriate", code_id))
     console.print(f"[green]Code evaluator {how}[/green] EscalationAppropriate ({code_id})")
 
+    # Project-scoped for the same reason as the groundedness task above.
+    code_task_name = f"Escalation monitor ({settings.arize_project_name})"
     code_task_id, how = upsert_task(
         client,
         space,
-        "Escalation monitor",
+        code_task_name,
         lambda: client.tasks.create_evaluation_task(
-            name="Escalation monitor",
+            name=code_task_name,
             task_type=TaskType.CODE_EVALUATION,
             project=settings.arize_project_name,
             # space is required for the project *name* to resolve to an id.
@@ -436,7 +438,7 @@ def main(
             "query_filter": "name = 'copilot.turn'",
         },
     )
-    console.print(f"[green]Task {how}[/green] Escalation monitor ({code_task_id})")
+    console.print(f"[green]Task {how}[/green] {code_task_name} ({code_task_id})")
 
     summarise(created, sampling_rate)
 

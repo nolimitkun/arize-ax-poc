@@ -116,7 +116,15 @@ def classify(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
 
 
 def agent(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
-    """The answer model with the version's tools bound."""
+    """The answer model with the version's tools bound.
+
+    The system prompt arrives pre-resolved in the config rather than being
+    looked up here: this node runs once per tool round, and `load_prompt("hub")`
+    is a remote fetch each time -- mid-turn the label could move, or a
+    transient failure could swap in the local fallback, leaving one turn
+    answered by two different prompts. `run_turn` resolves it once, like the
+    SDK engine does.
+    """
     settings = _settings(config)
     version = _conf(config, "prompt_version")
     llm = _ChatDeepSeek(
@@ -128,9 +136,24 @@ def agent(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
         max_tokens=8192,
         extra_body=THINKING_ON,
     ).bind_tools(tools_for(version))
-    system = SystemMessage(load_prompt(version, settings=settings))
+    system = SystemMessage(_conf(config, "system_prompt"))
     response = llm.invoke([system, *state["messages"]])
     return {"messages": [response], "agent_calls": state["agent_calls"] + 1}
+
+
+def _all_tool_calls(message: Any) -> list[dict[str, Any]]:
+    """Valid and malformed tool calls together.
+
+    LangChain routes a tool call whose arguments fail to parse as JSON into
+    `invalid_tool_calls` and leaves `tool_calls` empty. Reading only the latter
+    silently ends the turn with whatever partial text exists and no error --
+    the SDK engine instead answers the call with an invalid-arguments result
+    and lets the model retry, so both lists have to flow into the loop.
+    """
+    return [
+        *(getattr(message, "tool_calls", None) or []),
+        *(getattr(message, "invalid_tool_calls", None) or []),
+    ]
 
 
 def run_tools(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
@@ -148,8 +171,18 @@ def run_tools(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
             content=execute(ctx, call["name"], call["args"] or {}),
             tool_call_id=call["id"],
         )
-        for call in getattr(last, "tool_calls", [])
+        for call in getattr(last, "tool_calls", None) or []
     ]
+    for call in getattr(last, "invalid_tool_calls", None) or []:
+        # Mirrors the SDK engine's unparseable-arguments path: dispatch with
+        # empty args, which records the attempt as failed on the trajectory and
+        # returns an invalid-arguments message the model can react to.
+        results.append(
+            ToolMessage(
+                content=execute(ctx, call.get("name") or "", {}),
+                tool_call_id=call.get("id") or "invalid-tool-call",
+            )
+        )
     return {"messages": results}
 
 
@@ -161,7 +194,7 @@ def decide_next(state: GraphState) -> str:
     exact and testable offline. recursion_limit stays as a backstop only.
     """
     last = state["messages"][-1]
-    if not getattr(last, "tool_calls", None):
+    if not _all_tool_calls(last):
         return "end"
     if state["agent_calls"] >= MAX_TOOL_ITERATIONS:
         return "give_up"
@@ -179,8 +212,11 @@ def give_up(state: GraphState) -> dict[str, Any]:
     """
     last = state["messages"][-1]
     stubs = [
-        ToolMessage(content="Tool loop aborted: iteration cap reached.", tool_call_id=call["id"])
-        for call in getattr(last, "tool_calls", [])
+        ToolMessage(
+            content="Tool loop aborted: iteration cap reached.",
+            tool_call_id=call.get("id") or "invalid-tool-call",
+        )
+        for call in _all_tool_calls(last)
     ]
     return {"error": "max_tool_iterations_exceeded", "messages": stubs}
 
@@ -258,6 +294,9 @@ def run_turn(
             "settings": settings,
             "tool_ctx": ctx,
             "prompt_version": version,
+            # Resolved once per turn -- "hub" is a remote fetch, and the agent
+            # node runs once per tool round (see the node's docstring).
+            "system_prompt": load_prompt(version, settings=settings),
             "answer_model": answer_model,
             "thread_id": thread_id,
         },

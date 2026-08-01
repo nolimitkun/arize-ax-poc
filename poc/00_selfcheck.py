@@ -561,9 +561,11 @@ def check_annotation_queue_inputs() -> None:
     # project's spans with no online evaluator at all.
     task_source = _Path(__file__).with_name("05_online_evals.py").read_text()
     check(
-        "the online task name is scoped to the project too",
+        "the online task names are scoped to the project too",
         "Groundedness monitor ({settings.arize_project_name})" in task_source
-        and '"Groundedness monitor",' not in task_source,
+        and "Escalation monitor ({settings.arize_project_name})" in task_source
+        and '"Groundedness monitor",' not in task_source
+        and '"Escalation monitor",' not in task_source,
     )
 
     # The simulated reviewer's noise has to be a property of the span, not of
@@ -1065,6 +1067,34 @@ def check_langgraph_engine() -> None:
         ga.decide_next(looping) == "tools"
         and ga.decide_next(capped) == "give_up"
         and ga.decide_next(finished) == "end",
+    )
+
+    # A tool call with unparseable JSON arguments lands in invalid_tool_calls,
+    # not tool_calls. It must still route into the loop -- the SDK engine
+    # answers it with an invalid-arguments result and lets the model retry;
+    # ignoring it ends the turn with partial text and no recorded error.
+    malformed = AIMessage(
+        content="",
+        invalid_tool_calls=[
+            {"name": "search_docs", "args": "{not json", "id": "bad-1", "error": "not json"}
+        ],
+    )
+    check(
+        "malformed tool calls route back into the loop, not to END",
+        ga.decide_next({**looping, "messages": [malformed]}) == "tools",
+    )
+    ctx = __import__("copilot.tools", fromlist=["ToolContext"]).ToolContext()
+    out = ga.run_tools(
+        {"messages": [malformed], "agent_calls": 1, "intent": "other", "error": None},
+        {"configurable": {"tool_ctx": ctx}},
+    )
+    reply = out["messages"][0]
+    check(
+        "...and get an invalid-arguments tool result the model can react to",
+        reply.tool_call_id == "bad-1"
+        and "Invalid arguments" in str(reply.content)
+        and ctx.calls and not ctx.calls[0].ok,
+        f"content={str(reply.content)[:60]!r}",
     )
 
     # Dispatch: settings.impl decides the engine, at call time, per turn.
