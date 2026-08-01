@@ -36,7 +36,6 @@ def init_tracing(settings: Settings, project_name: str | None = None) -> trace_a
     # Imported lazily so that importing this module doesn't pull in the whole
     # OTel stack for scripts that only need the platform client.
     from arize.otel import register
-    from openinference.instrumentation.openai import OpenAIInstrumentor
 
     # endpoint is passed explicitly rather than left to register()'s default,
     # so the region resolved in config.py is the one that actually applies.
@@ -46,7 +45,19 @@ def init_tracing(settings: Settings, project_name: str | None = None) -> trace_a
         project_name=project_name or settings.arize_project_name,
         endpoint=settings.arize_otlp_endpoint,
     )
-    OpenAIInstrumentor().instrument(tracer_provider=tracer_provider, skip_dep_check=True)
+
+    # One instrumentor, never both. The LangGraph engine's LLM calls go through
+    # langchain-openai, which drives the `openai` SDK underneath -- with both
+    # instrumentors active every call would emit two LLM spans and double-count
+    # tokens and cost in AX.
+    if settings.impl == "langgraph":
+        from openinference.instrumentation.langchain import LangChainInstrumentor
+
+        LangChainInstrumentor().instrument(tracer_provider=tracer_provider)
+    else:
+        from openinference.instrumentation.openai import OpenAIInstrumentor
+
+        OpenAIInstrumentor().instrument(tracer_provider=tracer_provider, skip_dep_check=True)
 
     _TRACER = tracer_provider.get_tracer(__name__)
     _INITIALIZED = True

@@ -138,7 +138,26 @@ def run_turn(
     cheap model either way. It exists so poc/08 can hold the prompt fixed and
     vary the model instead -- the same experiment machinery, a different
     independent variable.
+
+    With COPILOT_IMPL=langgraph the turn runs through the LangGraph engine
+    instead (see graph_agent.py) -- same contract, same TurnResult, different
+    machinery under the trace.
     """
+    if settings.impl == "langgraph":
+        from . import graph_agent
+
+        return graph_agent.run_turn(
+            question,
+            settings=settings,
+            history=history,
+            prompt_version=prompt_version,
+            session_id=session_id,
+            user_id=user_id,
+            extra_metadata=extra_metadata,
+            tags=tags,
+            model=model,
+        )
+
     version = prompt_version or settings.prompt_version
     answer_model = model or AGENT_MODEL
     session_id = session_id or f"sess-{uuid.uuid4().hex[:12]}"
@@ -265,6 +284,18 @@ def run_conversation(
     extra_metadata: dict[str, Any] | None = None,
 ) -> list[TurnResult]:
     """Run several turns under one session id, carrying history between them."""
+    if settings.impl == "langgraph":
+        from . import graph_agent
+
+        return graph_agent.run_conversation(
+            questions,
+            settings=settings,
+            prompt_version=prompt_version,
+            user_id=user_id,
+            session_id=session_id,
+            extra_metadata=extra_metadata,
+        )
+
     session_id = session_id or f"sess-{uuid.uuid4().hex[:12]}"
     history: list[dict[str, Any]] = []
     results: list[TurnResult] = []

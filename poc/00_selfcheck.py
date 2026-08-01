@@ -555,6 +555,19 @@ def check_annotation_queue_inputs() -> None:
         "def queue_name(" in source and 'name="Groundedness review"' not in source,
     )
 
+    # The online eval task has the same failure shape, discovered on the second
+    # project's tour: `find_task` matches on name space-wide, so a fixed name
+    # "reuses" the first project's task, prints success, and leaves the new
+    # project's spans with no online evaluator at all.
+    task_source = _Path(__file__).with_name("05_online_evals.py").read_text()
+    check(
+        "the online task names are scoped to the project too",
+        "Groundedness monitor ({settings.arize_project_name})" in task_source
+        and "Escalation monitor ({settings.arize_project_name})" in task_source
+        and '"Groundedness monitor",' not in task_source
+        and '"Escalation monitor",' not in task_source,
+    )
+
     # The simulated reviewer's noise has to be a property of the span, not of
     # the interpreter. `hash()` on a str is salted per process, so the labels
     # changed on every run -- and poc/06b splits exactly these labels into train
@@ -985,6 +998,155 @@ def check_region_wiring() -> None:
         )
 
 
+def check_langgraph_engine() -> None:
+    """The second engine: same logic through LangGraph/LangChain.
+
+    Everything here runs offline -- the graph compiles, tools bind, and the
+    dispatch fires without a single network call, so a live failure means
+    "model/platform", not "the wiring is wrong".
+    """
+    console.print("\n[bold]LangGraph engine (COPILOT_IMPL=langgraph)[/bold]")
+    import os
+    from pathlib import Path
+
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+    import copilot.agent as agent_mod
+    from copilot import graph_agent as ga
+    from copilot.agent import MAX_TOOL_ITERATIONS, TurnResult
+    from copilot.config import Settings, load_settings
+    from copilot.tools import TOOLS_V1, TOOLS_V2
+
+    nodes = set(ga.build_graph().compile().get_graph().nodes)
+    check(
+        "the graph compiles with the copilot's four nodes",
+        {"classify", "agent", "tools", "give_up"} <= nodes,
+        f"nodes: {sorted(nodes)}",
+    )
+
+    # The seeded tool mis-routing lives in the v1 descriptions, so they must
+    # reach the model byte for byte -- bind_tools takes the dicts as-is.
+    llm = ga._ChatDeepSeek(
+        model="deepseek-v4-pro", api_key="offline", api_base="https://example.invalid/v1"
+    )
+    check("v1's deliberately-vague tool schemas bind verbatim",
+          llm.bind_tools(TOOLS_V1).kwargs["tools"] == TOOLS_V1)
+    check("...and v2's fixed ones too",
+          llm.bind_tools(TOOLS_V2).kwargs["tools"] == TOOLS_V2)
+
+    # DeepSeek 400s a tool loop whose assistant messages come back without
+    # their CoT; ChatDeepSeek captures it but never re-sends it, so the echo
+    # lives in our subclass and is asserted here.
+    tool_call = [{"name": "search_docs", "args": {"query": "q"}, "id": "call-1"}]
+    payload = llm._get_request_payload(
+        [
+            HumanMessage("q"),
+            AIMessage(content="", tool_calls=tool_call,
+                      additional_kwargs={"reasoning_content": "COT"}),
+            ToolMessage(content="result", tool_call_id="call-1"),
+        ]
+    )
+    assistants = [m for m in payload["messages"] if m["role"] == "assistant"]
+    check("tool-loop requests echo reasoning_content back",
+          bool(assistants) and assistants[0].get("reasoning_content") == "COT")
+    plain = llm._get_request_payload(
+        [HumanMessage("q"), AIMessage(content="hi", additional_kwargs={"reasoning_content": "COT"})]
+    )
+    check("...but plain assistant messages do not carry it",
+          all("reasoning_content" not in m for m in plain["messages"]))
+
+    # The loop cap is enforced in the routing function, not recursion_limit.
+    looping = {
+        "messages": [AIMessage(content="", tool_calls=tool_call)],
+        "agent_calls": 1, "intent": "other", "error": None,
+    }
+    capped = {**looping, "agent_calls": MAX_TOOL_ITERATIONS}
+    finished = {**looping, "messages": [AIMessage(content="done")]}
+    check(
+        "the tool loop routes loop/cap/end correctly",
+        ga.decide_next(looping) == "tools"
+        and ga.decide_next(capped) == "give_up"
+        and ga.decide_next(finished) == "end",
+    )
+
+    # A tool call with unparseable JSON arguments lands in invalid_tool_calls,
+    # not tool_calls. It must still route into the loop -- the SDK engine
+    # answers it with an invalid-arguments result and lets the model retry;
+    # ignoring it ends the turn with partial text and no recorded error.
+    malformed = AIMessage(
+        content="",
+        invalid_tool_calls=[
+            {"name": "search_docs", "args": "{not json", "id": "bad-1", "error": "not json"}
+        ],
+    )
+    check(
+        "malformed tool calls route back into the loop, not to END",
+        ga.decide_next({**looping, "messages": [malformed]}) == "tools",
+    )
+    ctx = __import__("copilot.tools", fromlist=["ToolContext"]).ToolContext()
+    out = ga.run_tools(
+        {"messages": [malformed], "agent_calls": 1, "intent": "other", "error": None},
+        {"configurable": {"tool_ctx": ctx}},
+    )
+    reply = out["messages"][0]
+    check(
+        "...and get an invalid-arguments tool result the model can react to",
+        reply.tool_call_id == "bad-1"
+        and "Invalid arguments" in str(reply.content)
+        and ctx.calls and not ctx.calls[0].ok,
+        f"content={str(reply.content)[:60]!r}",
+    )
+
+    # Dispatch: settings.impl decides the engine, at call time, per turn.
+    dummy = Settings(
+        arize_api_key="x", arize_space_id="x", arize_space_name="x",
+        arize_project_name="x", arize_region=None, arize_otlp_endpoint="x",
+        deepseek_api_key="x", deepseek_base_url="x",
+        arize_ai_integration_id=None, prompt_version="v1", impl="langgraph",
+    )
+    sentinel = TurnResult(question="q", answer="from-langgraph")
+    real_run_turn = ga.run_turn
+    try:
+        ga.run_turn = lambda question, **kwargs: sentinel
+        dispatched = agent_mod.run_turn("q", settings=dummy)
+    finally:
+        ga.run_turn = real_run_turn
+    check("agent.run_turn dispatches to the LangGraph engine", dispatched is sentinel)
+
+    # The -lg project suffix keeps the engines' traffic apart.
+    saved = {k: os.environ.get(k) for k in
+             ("ARIZE_API_KEY", "ARIZE_SPACE_ID", "ARIZE_SPACE_NAME", "DEEPSEEK_API_KEY",
+              "ARIZE_PROJECT_NAME", "COPILOT_IMPL")}
+    try:
+        os.environ.update(
+            ARIZE_API_KEY="x", ARIZE_SPACE_ID="x", ARIZE_SPACE_NAME="x",
+            DEEPSEEK_API_KEY="x", ARIZE_PROJECT_NAME="proj",
+        )
+        os.environ["COPILOT_IMPL"] = "langgraph"
+        lg_project = load_settings().arize_project_name
+        os.environ["COPILOT_IMPL"] = "sdk"
+        sdk_project = load_settings().arize_project_name
+    finally:
+        for key, value in saved.items():
+            os.environ.pop(key, None)
+            if value is not None:
+                os.environ[key] = value
+    check(
+        "COPILOT_IMPL=langgraph writes to its own -lg project",
+        lg_project == "proj-lg" and sdk_project == "proj",
+        f"langgraph={lg_project!r} sdk={sdk_project!r}",
+    )
+
+    # One instrumentor, never both -- two would double-count tokens and cost.
+    source = (Path(__file__).parent.parent / "src" / "copilot" / "tracing.py").read_text()
+    check(
+        "tracing instruments exactly one SDK per engine",
+        'if settings.impl == "langgraph"' in source
+        and "LangChainInstrumentor" in source
+        and source.index("LangChainInstrumentor") < source.index("OpenAIInstrumentor"),
+    )
+
+
 def check_sdk_surface() -> None:
     console.print("\n[bold]SDK surface[/bold]")
     try:
@@ -1051,6 +1213,7 @@ def main() -> None:
     check_dataframe_contracts()
     check_targets_ax_not_phoenix()
     check_region_wiring()
+    check_langgraph_engine()
     check_sdk_surface()
 
     console.print()

@@ -18,6 +18,8 @@ help:
 	@echo "  make all        Run the whole tour end to end"
 	@echo ""
 	@echo "  Lettered steps (02b, 04b, 06b) are side paths off the step they follow."
+	@echo ""
+	@echo "  COPILOT_IMPL=langgraph make all   Same tour, LangGraph engine, own -lg project"
 
 install:
 	uv sync

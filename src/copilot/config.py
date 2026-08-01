@@ -37,6 +37,7 @@ class Settings:
     deepseek_base_url: str
     arize_ai_integration_id: str | None
     prompt_version: str
+    impl: str = "sdk"
 
     @property
     def app_url(self) -> str:
@@ -101,6 +102,22 @@ def _resolve_otlp_endpoint(region: str | None) -> str:
     return _REGION_OTLP_ENDPOINTS.get(region or "", DEFAULT_OTLP_ENDPOINT)
 
 
+# Two engines produce the traffic: the hand-written tool loop over the raw
+# `openai` SDK ("sdk", the default) and the LangGraph/LangChain build of the
+# same copilot ("langgraph"). Same prompts, same tools, same corpus, same
+# seeded failures -- COPILOT_IMPL picks which one `copilot.agent` dispatches to.
+_IMPLS = ("sdk", "langgraph")
+
+
+def _resolve_impl() -> str:
+    impl = os.getenv("COPILOT_IMPL", "sdk").strip().lower()
+    if impl not in _IMPLS:
+        raise ConfigError(
+            f"COPILOT_IMPL={impl!r} is not one of {', '.join(_IMPLS)}."
+        )
+    return impl
+
+
 def load_settings() -> Settings:
     missing = [f"  {name:<22} ({where})" for name, where in _REQUIRED.items() if not os.getenv(name)]
     if missing:
@@ -110,17 +127,25 @@ def load_settings() -> Settings:
             + "\n\nCopy .env.example to .env and fill these in."
         )
     region = os.getenv("ARIZE_REGION") or None
+    impl = _resolve_impl()
+    project_name = os.getenv("ARIZE_PROJECT_NAME", "nimbus-support-copilot")
+    # The LangGraph engine writes to its own project so the two engines'
+    # traffic never mixes -- traces, online eval tasks, monitors, and the
+    # per-project review queue all follow the project name.
+    if impl == "langgraph" and not project_name.endswith("-lg"):
+        project_name = f"{project_name}-lg"
     return Settings(
         arize_api_key=os.environ["ARIZE_API_KEY"],
         arize_space_id=os.environ["ARIZE_SPACE_ID"],
         arize_space_name=os.environ["ARIZE_SPACE_NAME"],
-        arize_project_name=os.getenv("ARIZE_PROJECT_NAME", "nimbus-support-copilot"),
+        arize_project_name=project_name,
         arize_region=region,
         arize_otlp_endpoint=_resolve_otlp_endpoint(region),
         deepseek_api_key=os.environ["DEEPSEEK_API_KEY"],
         deepseek_base_url=os.getenv("DEEPSEEK_BASE_URL", DEEPSEEK_BASE_URL),
         arize_ai_integration_id=os.getenv("ARIZE_AI_INTEGRATION_ID") or None,
         prompt_version=os.getenv("COPILOT_PROMPT_VERSION", "v1"),
+        impl=impl,
     )
 
 
