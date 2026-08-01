@@ -1324,6 +1324,210 @@ def check_langgraph_engine() -> None:
     )
 
 
+def check_langsmith_tour() -> None:
+    """The ls-steps: same tour, LangSmith platform APIs.
+
+    All offline. The two contracts that matter most: the trajectory rebuild
+    (LangSmith drops custom span attributes, so tools/docs come from child
+    runs), and that every SDK method the port calls actually exists -- the
+    port leans on a couple of surfaces (update_run, _create_commit_tags) that
+    were verified against 0.10.15 and should fail loudly here if an upgrade
+    removes them.
+    """
+    console.print("\n[bold]LangSmith tour (poc/ls*.py)[/bold]")
+    from datetime import datetime, timezone
+    from importlib import import_module
+    from types import SimpleNamespace
+
+    # Every ls-step imports cleanly (they import their Arize originals too,
+    # so this also catches a refactor of 03-10 breaking the reuse).
+    modules = {}
+    for stem in (
+        "_ls_common", "ls02b_log_runs", "ls03_query_runs", "ls04_offline_evals",
+        "ls04b_thread_evals", "ls05_online_rules", "ls06_annotations",
+        "ls06b_align_judge", "ls07_dataset", "ls08_experiments",
+        "ls09_prompt_hub", "ls10_dashboards",
+    ):
+        try:
+            modules[stem] = import_module(stem)
+        except Exception as exc:  # noqa: BLE001
+            check(f"{stem} imports", False, f"{type(exc).__name__}: {exc}")
+    check("all ls-steps import cleanly", len(modules) == 12, f"{len(modules)}/12")
+
+    # The SDK surface the port calls, including the two load-bearing
+    # not-quite-public ones (see ls09's tagging comment).
+    from langsmith import Client
+
+    needed = (
+        "list_runs", "update_run", "create_feedback", "batch_ingest_runs",
+        "create_annotation_queue", "add_runs_to_annotation_queue",
+        "list_annotation_queues", "list_runs_from_annotation_queue",
+        "create_dataset", "has_dataset", "create_examples", "list_examples",
+        "read_example", "update_example", "evaluate", "push_prompt",
+        "pull_prompt", "list_prompt_commits", "_create_commit_tags",
+        "read_project", "request_with_retries",
+    )
+    missing = [m for m in needed if not hasattr(Client, m)]
+    check(
+        f"langsmith.Client has all {len(needed)} methods the port calls",
+        not missing,
+        f"missing: {missing}",
+    )
+
+    # The trajectory rebuild: tools and docs from child runs, search_docs
+    # inferred from the kb.search retriever, doc ids deduplicated.
+    lsc = modules["_ls_common"]
+    now = datetime.now(timezone.utc)
+
+    def fake_run(name, run_type, offset=0, outputs=None, parent=None, meta=None):
+        return SimpleNamespace(
+            id=f"id-{name}-{offset}", trace_id="t1", name=name, run_type=run_type,
+            start_time=now.replace(microsecond=offset), inputs={"input": "q?"},
+            outputs=outputs or {"text": "a."}, parent_run_id=parent,
+            extra={"metadata": meta or {}}, error=None, total_tokens=7,
+        )
+
+    root = fake_run(
+        "copilot.turn", "chain",
+        meta={"session_id": "sess-1", "prompt_version": "v1", "turn_index": 0},
+    )
+    children = [
+        fake_run("ChatCompletion", "llm", 1, parent="p"),
+        fake_run("kb.search", "retriever", 2, outputs={"doc_ids": ["d1", "d2"]}, parent="p"),
+        fake_run("kb.search", "retriever", 3, outputs={"doc_ids": ["d2", "d3"]}, parent="p"),
+        fake_run("lookup_order", "tool", 4, parent="p"),
+    ]
+    frame = lsc.turn_runs_to_df([root], {"t1": children})
+    row = frame.iloc[0]
+    check(
+        "turn_runs_to_df rebuilds the trajectory from child runs",
+        row["tool_calls"] == "search_docs,lookup_order",
+        row["tool_calls"],
+    )
+    check(
+        "...deduplicating retrieved doc ids in order",
+        row["retrieved_doc_ids"] == "d1,d2,d3",
+        row["retrieved_doc_ids"],
+    )
+    check(
+        "...and carrying thread metadata (session_id) through",
+        row["session_id"] == "sess-1" and row["prompt_version"] == "v1",
+    )
+
+    # Guard symmetry: ls-steps step aside under arize-only, pass otherwise.
+    from copilot.config import Settings
+
+    arize_only = Settings(
+        arize_api_key="x", arize_space_id="x", arize_space_name="x",
+        arize_project_name="proj", arize_region=None, arize_otlp_endpoint="x",
+        deepseek_api_key="x", deepseek_base_url="x",
+        arize_ai_integration_id=None, prompt_version="v1",
+    )
+    try:
+        with console.capture():
+            lsc.require_langsmith(arize_only, "selfcheck")
+        skipped = None
+    except SystemExit as exc:
+        skipped = exc.code
+    check("require_langsmith skips (exit 0) when LangSmith is disabled", skipped == 0)
+    both = Settings(
+        arize_api_key="x", arize_space_id="x", arize_space_name="x",
+        arize_project_name="proj", arize_region=None, arize_otlp_endpoint="x",
+        deepseek_api_key="x", deepseek_base_url="x",
+        arize_ai_integration_id=None, prompt_version="v1",
+        observability="both", langsmith_api_key="x", langsmith_project="proj",
+    )
+    try:
+        lsc.require_langsmith(both, "selfcheck")
+        check("...and lets `both` mode straight through", True)
+    except SystemExit:
+        check("...and lets `both` mode straight through", False)
+    check(
+        "the API host maps to the matching app URL (EU included)",
+        lsc.app_url(both) == "https://smith.langchain.com"
+        and lsc.app_url(
+            Settings(
+                arize_api_key="x", arize_space_id="x", arize_space_name="x",
+                arize_project_name="p", arize_region=None, arize_otlp_endpoint="x",
+                deepseek_api_key="x", deepseek_base_url="x",
+                arize_ai_integration_id=None, prompt_version="v1",
+                observability="langsmith", langsmith_api_key="x",
+                langsmith_base_url="https://eu.api.smith.langchain.com",
+            )
+        )
+        == "https://eu.smith.langchain.com",
+    )
+
+    # Prompt Hub plumbing: system text extraction from a real ChatPromptTemplate,
+    # and the loader's fallback-vs-strict behaviour without any network.
+    import langsmith as ls_pkg
+
+    from copilot import prompts as prompts_mod
+
+    template = modules["ls09_prompt_hub"].make_template("hello world")
+    check(
+        "ls_system_text reads a real ChatPromptTemplate",
+        prompts_mod.ls_system_text(template) == "hello world",
+        prompts_mod.ls_system_text(template),
+    )
+    try:
+        prompts_mod.load_prompt("bogus")
+        check("unknown prompt versions still raise", False)
+    except ValueError as exc:
+        check("unknown prompt versions still raise (and name ls-hub)", "ls-hub" in str(exc))
+
+    class _Boom:
+        def __init__(self, *a, **k):
+            raise RuntimeError("no network in selfcheck")
+
+    real_client = ls_pkg.Client
+    try:
+        ls_pkg.Client = _Boom
+        with console.capture():
+            fallback = prompts_mod.load_prompt("ls-hub", settings=both)
+        check("ls-hub falls back to local V2 when the fetch fails", fallback == prompts_mod.V2)
+        try:
+            prompts_mod.load_prompt("ls-hub", settings=both, strict=True)
+            check("...but strict=True raises instead", False)
+        except RuntimeError:
+            check("...but strict=True raises instead", True)
+    finally:
+        ls_pkg.Client = real_client
+
+    # ls08's adapters: an 08 evaluator wrapped for LangSmith, and the results
+    # frame renamed into the shape 08's compare machinery expects.
+    ls08 = modules["ls08_experiments"]
+    exp = import_module("08_experiments")
+    wrapped = ls08.wrap_evaluator(exp.conciseness, "conciseness")
+    verdict = wrapped(
+        SimpleNamespace(outputs={"answer": "short and sweet"}),
+        SimpleNamespace(inputs={"question": "q"}, outputs={"expected_behavior": ""}),
+    )
+    check(
+        "wrap_evaluator turns an 08 evaluator into LangSmith feedback",
+        verdict["key"] == "conciseness" and verdict["score"] == 1.0,
+        str(verdict),
+    )
+    fake_results = SimpleNamespace(
+        to_pandas=lambda: pd.DataFrame(
+            {"example_id": ["e1"], "feedback.groundedness": [1.0], "outputs.answer": ["a"]}
+        )
+    )
+    renamed = ls08.to_frame(fake_results)
+    check(
+        "to_frame renames feedback columns into 08's .score shape",
+        "eval.groundedness.score" in renamed.columns and "example_id" in renamed.columns,
+        str(list(renamed.columns)),
+    )
+
+    # Project-scoped names everywhere a workspace-level artefact gets created.
+    check(
+        "rule, section and queue names are all project-scoped",
+        modules["ls05_online_rules"].rule_name("R", "proj").endswith("(proj)")
+        and modules["ls10_dashboards"].section_name("proj").endswith("(proj)"),
+    )
+
+
 def check_sdk_surface() -> None:
     console.print("\n[bold]SDK surface[/bold]")
     try:
@@ -1392,6 +1596,7 @@ def main() -> None:
     check_region_wiring()
     check_observability()
     check_langgraph_engine()
+    check_langsmith_tour()
     check_sdk_surface()
 
     console.print()

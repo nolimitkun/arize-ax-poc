@@ -356,7 +356,7 @@ def compare(base_key: str, cand_key: str, summaries: dict, frames: dict) -> None
         console.print(
             f"[bold]No measurable difference[/bold] between {base_key} and {cand_key}. "
             f"Nothing moved beyond noise on {len(base_df) if base_df is not None else 0} "
-            f"rows.{trailer} Read the per-row explanations in the Arize experiment view "
+            f"rows.{trailer} Read the per-row explanations in the experiment view "
             "before changing anything again — and note that a bigger dataset raises "
             "what this test can detect.\n"
         )

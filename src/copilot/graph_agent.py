@@ -286,6 +286,10 @@ def run_turn(
         "agent_model": answer_model,
         "turn_index": _turn_index if _turn_index is not None else len(history or []) // 2,
         "engine": "langgraph",
+        # session_id doubles as metadata: Arize Sessions read the session.id
+        # attribute, LangSmith Threads read metadata -- see agent.py.
+        "session_id": session_id,
+        "user_id": user_id or "anonymous",
         **(extra_metadata or {}),
     }
 

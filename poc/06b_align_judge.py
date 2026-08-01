@@ -53,7 +53,11 @@ MAX_EXAMPLES = 6
 BALLAST = 2
 
 
-def labelled_rows(turns: pd.DataFrame) -> pd.DataFrame:
+def labelled_rows(
+    turns: pd.DataFrame,
+    human_name: str = "06_annotations.parquet",
+    judge_name: str = "04_evals.parquet",
+) -> pd.DataFrame:
     """Turns carrying both a human label and a judge verdict, with their context.
 
     Everything downstream is a comparison between those two columns, so a row
@@ -62,14 +66,14 @@ def labelled_rows(turns: pd.DataFrame) -> pd.DataFrame:
     """
     from copilot.kb import context_for_ids
 
-    human = load("06_annotations.parquet")
-    judge = load("04_evals.parquet")
+    human = load(human_name)
+    judge = load(judge_name)
 
     human_col = f"annotation.{ANNOTATION_NAME}.label"
     judge_col = "eval.groundedness.label"
     for frame, col, where in (
-        (human, human_col, "poc/06_annotations.py"),
-        (judge, judge_col, "poc/04_offline_evals.py"),
+        (human, human_col, "the annotations step"),
+        (judge, judge_col, "the offline-evals step"),
     ):
         if col not in frame.columns:
             console.print(f"[red]{col} missing[/red] — re-run {where} first.")

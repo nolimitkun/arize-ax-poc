@@ -22,6 +22,8 @@ dependencies = [
     "langchain-core>=0.3",
     "langchain-deepseek>=0.1",
     "openinference-instrumentation-langchain>=0.1",
+    # Already in the tree via langchain-core; direct because poc/ls* calls it.
+    "langsmith>=0.10",
 ]
 
 [build-system]

@@ -1,4 +1,5 @@
-.PHONY: help install check trace backfill observe evaluate improve monitor all clean
+.PHONY: help install check trace backfill observe evaluate improve monitor all \
+        ls-backfill ls-observe ls-evaluate ls-improve ls-monitor ls-all clean
 
 PY := uv run python
 
@@ -22,6 +23,9 @@ help:
 	@echo "  COPILOT_IMPL=langgraph make all          Same tour, LangGraph engine, own -lg project"
 	@echo "  COPILOT_OBSERVABILITY=both make trace    Same spans to Arize and LangSmith at once"
 	@echo "  COPILOT_OBSERVABILITY=langsmith make all Traces to LangSmith only; 02b-10 skip"
+	@echo ""
+	@echo "  make ls-all     The LangSmith mirror of the tour (steps ls03-ls10);"
+	@echo "                  needs COPILOT_OBSERVABILITY=langsmith or both for traffic"
 
 install:
 	uv sync
@@ -56,6 +60,35 @@ monitor:
 	$(PY) poc/10_monitors.py
 
 all: trace observe evaluate improve monitor
+
+# ---- the LangSmith mirror (poc/ls*.py) ------------------------------------
+# Same tour against LangSmith's platform APIs. Traffic comes from the shared
+# `make trace` run with COPILOT_OBSERVABILITY=langsmith or both.
+
+# Not in `ls-all`: writes to its own project, independent of the tour (like 02b).
+ls-backfill:
+	$(PY) poc/ls02b_log_runs.py
+
+ls-observe:
+	$(PY) poc/ls03_query_runs.py
+
+# ls06 runs before ls05: the routing rule ls05 creates needs ls06's queue.
+ls-evaluate:
+	$(PY) poc/ls04_offline_evals.py
+	$(PY) poc/ls04b_thread_evals.py
+	$(PY) poc/ls06_annotations.py
+	$(PY) poc/ls05_online_rules.py
+	$(PY) poc/ls06b_align_judge.py
+
+ls-improve:
+	$(PY) poc/ls07_dataset.py
+	$(PY) poc/ls08_experiments.py
+	$(PY) poc/ls09_prompt_hub.py
+
+ls-monitor:
+	$(PY) poc/ls10_dashboards.py
+
+ls-all: ls-observe ls-evaluate ls-improve ls-monitor
 
 clean:
 	rm -rf .venv **/__pycache__ .out

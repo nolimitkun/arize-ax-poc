@@ -49,7 +49,7 @@ from copilot.evals import TURN_FAILURE_EVALS as FAILING_EVALS  # noqa: E402
 SELECTION_EVALS = ("eval.groundedness.score", "eval.conciseness.score")
 
 
-def merge_eval_verdicts(turns):
+def merge_eval_verdicts(turns, evals_name: str = "04_evals.parquet"):
     """Attach step 04's verdicts and derive `selected_failure` per turn.
 
     Falls back to step 03's `is_failure` heuristics when no eval results are
@@ -57,11 +57,11 @@ def merge_eval_verdicts(turns):
     but the eval path is the one that finds the real failures.
     """
     try:
-        evals = load("04_evals.parquet")
+        evals = load(evals_name)
     except SystemExit:
         console.print(
-            "[yellow]No 04_evals.parquet — falling back to step 03's heuristics.[/yellow]\n"
-            "[dim]Run poc/04_offline_evals.py for a dataset built from eval verdicts.[/dim]"
+            f"[yellow]No {evals_name} — falling back to step 03's heuristics.[/yellow]\n"
+            "[dim]Run the offline-evals step for a dataset built from eval verdicts.[/dim]"
         )
         turns = turns.copy()
         turns["selected_failure"] = turns.apply(

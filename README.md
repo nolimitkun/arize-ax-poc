@@ -474,6 +474,8 @@ src/copilot/
 poc/00..10_*.py           the tour, one script per feature area
 poc/02b, 04b, 06b         side paths: backfill, session evals, judge alignment
 poc/_common.py            console chrome, client, time windows, the McNemar test
+poc/ls02b..ls10_*.py      the same tour against LangSmith (see below)
+poc/_ls_common.py         the LangSmith plumbing: client, guard, run→frame
 ```
 
 Trace shape produced by one turn:
@@ -556,15 +558,50 @@ tracing via `LANGSMITH_TRACING` + callbacks — would only cover the LangGraph
 engine and would run parallel to OTel, splitting the trace tree between two
 systems.
 
-The honest caveat: tracing is the only part of this POC that is
-platform-portable. Steps 02b–10 drive Arize *platform* APIs — span export,
-evaluators, annotation queues, datasets, experiments, prompt hub, monitors —
-and have no LangSmith counterpart here. Under `langsmith`-only they print a
-skip banner and exit 0, so `make all` still completes: 01–02 trace to
-LangSmith, the rest step aside. Credentials follow the same logic — a
-LangSmith-only run needs no `ARIZE_*` variables at all, and vice versa
-(`LANGSMITH_API_KEY`, from smith.langchain.com → Settings → API Keys; EU orgs
-also set `LANGSMITH_ENDPOINT=https://eu.api.smith.langchain.com`).
+Steps 02b–10 drive Arize *platform* APIs and step aside cleanly under
+`langsmith`-only (skip banner, exit 0), so `make all` still completes.
+Credentials follow the same logic — a LangSmith-only run needs no `ARIZE_*`
+variables at all, and vice versa (`LANGSMITH_API_KEY`, from
+smith.langchain.com → Settings → API Keys; EU orgs also set
+`LANGSMITH_ENDPOINT=https://eu.api.smith.langchain.com`).
+
+### The LangSmith tour (poc/ls*.py)
+
+Each Arize platform step also has a LangSmith mirror, so both platforms run
+the *whole* loop, side by side, on the same traffic:
+
+```bash
+COPILOT_OBSERVABILITY=both make trace   # traffic both platforms can see
+make ls-all                             # ls03 → ls10 (make all runs the Arize side)
+```
+
+The mirrors import the originals' logic — failure definitions, judges, code
+evaluators, the alignment machinery, the paired McNemar comparison — and swap
+only the platform half, which keeps the two tours answerable to one
+definition of every metric:
+
+| LangSmith step | mirrors | what changes |
+|---|---|---|
+| `ls02b_log_runs` | 02b | `batch_ingest_runs` instead of `spans.log()`; verdicts arrive as feedback |
+| `ls03_query_runs` | 03 | `list_runs` + trajectory rebuilt from *child runs* (see below); failures become run tags |
+| `ls04_offline_evals` | 04 | same judges; results land as per-run feedback instead of `eval.*` columns |
+| `ls04b_thread_evals` | 04b | sessions group by `metadata.session_id` (LangSmith Threads); verdict on the closing run |
+| `ls05_online_rules` | 05 | automation rules via REST: route flagged runs to review; online judge needs a workspace model secret and says so if absent |
+| `ls06_annotations` | 06 | native annotation queues; simulated labels as feedback; same agreement table |
+| `ls06b_align_judge` | 06b | same alignment + holdout proof; publishes to the Prompt Hub because LangSmith has no hosted-evaluator object |
+| `ls07_dataset` | 07 | datasets with splits; human verdicts merged into example metadata; every write is auto-versioned |
+| `ls08_experiments` | 08 | `client.evaluate()` per arm; results renamed into 08's frame shape so the identical `compare()` runs |
+| `ls09_prompt_hub` | 09 | commits + a moving `production` *tag* (vs Arize's labels); runtime side is `load_prompt("ls-hub")` |
+| `ls10_dashboards` | 10 | custom dashboard via REST, dry-run by default; alerting is UI-only and the step says so |
+
+Two findings worth knowing before reading the code. LangSmith's OTel ingest
+**drops custom span attributes** (`copilot.*` never arrives), so ls03 rebuilds
+each turn's trajectory from its child runs — tool calls from `tool`-type
+children, `search_docs` inferred from the `kb.search` retriever child,
+doc ids from the retriever's outputs. And it does not derive thread metadata
+from the `session.id` attribute, so both engines write `session_id` into span
+metadata as well — Arize reads the attribute, LangSmith Threads read the
+metadata, one turn feeds both.
 
 ## Notes on the build
 
