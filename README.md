@@ -463,12 +463,13 @@ data/questions.jsonl      43 questions labelled with expected behaviour
 data/orders.json          fake order DB behind lookup_order
 
 src/copilot/
-  tracing.py              register() + OpenAIInstrumentor + span helpers
+  tracing.py              register() + one instrumentor per engine + span helpers
   kb.py                   BM25 retrieval, emits the RETRIEVER span
   tools.py                search_docs / lookup_order / escalate_ticket + v1|v2 schemas
   prompts.py              V1, V2, and the Prompt Hub loader
   evals.py                the groundedness + session judgements, and the aligner
   agent.py                run_turn / run_conversation — AGENT + CHAIN spans, sessions
+  graph_agent.py          the same copilot as a LangGraph graph (COPILOT_IMPL=langgraph)
 
 poc/00..10_*.py           the tour, one script per feature area
 poc/02b, 04b, 06b         side paths: backfill, session evals, judge alignment
@@ -487,6 +488,50 @@ AGENT      copilot.turn
 ```
 
 ---
+
+## Second engine: LangGraph
+
+The copilot exists twice. The default engine is the hand-written tool loop
+described above; setting one variable runs the same copilot as a
+LangGraph/LangChain graph instead:
+
+```bash
+COPILOT_IMPL=langgraph make all
+```
+
+Same prompts, same tool schemas (v1's vague descriptions bind verbatim — the
+seeded mis-routing survives), same corpus, same question set, same seeded
+failures. What changes is the machinery and who emits the spans:
+
+```
+AGENT      copilot.turn                       (manual — the tour's unit of analysis)
+└─ CHAIN     LangGraph                        (auto — LangChainInstrumentor)
+   ├─ CHAIN    classify        → LLM          (flash, thinking off)
+   ├─ AGENT    agent           → LLM          (pro, tools bound)
+   ├─ CHAIN    tools
+   │  ├─ RETRIEVER kb.search                  (same code as the SDK engine)
+   │  └─ TOOL      lookup_order / escalate_ticket
+   └─ AGENT    agent           → LLM          (the loop, until no tool calls)
+```
+
+Because the root span, its `copilot.*` attributes, and the tool spans are
+identical, every tour script works unchanged — the engines differ only *inside*
+the trace, which is exactly what to go look at in AX: open a trace in each
+project and compare what hand instrumentation shows against what the framework
+instrumentor captures (per-node inputs/outputs, the graph structure itself).
+
+The LangGraph engine writes to its own project — `$ARIZE_PROJECT_NAME-lg` — so
+the two engines' traffic, online eval tasks, monitors, and review queues never
+mix. Multi-turn history rides in a LangGraph checkpointer keyed by session id
+rather than being threaded by hand, and the tracer instruments exactly one SDK
+per engine (`LangChainInstrumentor` *or* `OpenAIInstrumentor`) — both at once
+would emit two LLM spans per call and double-count tokens and cost.
+
+One DeepSeek quirk needed handling that the raw-SDK engine got for free:
+`ChatDeepSeek` captures `reasoning_content` from tool-loop responses but never
+sends it back, and DeepSeek 400s a tool loop without it. `graph_agent.py`
+subclasses the model to echo the CoT on tool-calling assistant messages —
+`make check` asserts the echo offline.
 
 ## Notes on the build
 

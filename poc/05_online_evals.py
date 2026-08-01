@@ -318,12 +318,20 @@ def main(
             created.append(("template", "Groundedness", eval_id))
             console.print(f"[green]Template evaluator {how}[/green] Groundedness ({eval_id})")
 
+            # One task per project, not one per space -- the same trap the
+            # review queue fell into (see poc/06). A task is bound to a single
+            # project, but `find_task` matches on name space-wide and the drift
+            # comparison cannot see (or move) the project. With a fixed name,
+            # the second project's tour "reuses" the first project's task,
+            # prints success, and leaves its own spans with no online evaluator
+            # -- nothing downstream ever notices the difference.
+            task_name = f"Groundedness monitor ({settings.arize_project_name})"
             task_id, how = upsert_task(
                 client,
                 space,
-                "Groundedness monitor",
+                task_name,
                 lambda: client.tasks.create_evaluation_task(
-                    name="Groundedness monitor",
+                    name=task_name,
                     task_type=TaskType.TEMPLATE_EVALUATION,
                     project=settings.arize_project_name,
                     # space is required for the project *name* to resolve.
@@ -348,7 +356,7 @@ def main(
                     "query_filter": "name = 'copilot.turn'",
                 },
             )
-            console.print(f"[green]Task {how}[/green] Groundedness monitor ({task_id})\n")
+            console.print(f"[green]Task {how}[/green] {task_name} ({task_id})\n")
 
     # ---- 2. Online code evaluator ---------------------------------------
     #
