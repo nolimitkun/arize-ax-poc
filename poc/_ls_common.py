@@ -102,6 +102,7 @@ def turn_runs_to_df(root_runs: Iterable[Any], children_by_trace: dict[str, list[
                 "span_id": str(run.id),
                 "trace_id": str(run.trace_id),
                 "session_id": str(meta.get("session_id", "")),
+                "user_id": str(meta.get("user_id", "")),
                 "question": str((run.inputs or {}).get("input", "")),
                 "answer": str((run.outputs or {}).get("text", "")),
                 "tool_calls": ",".join(tools),

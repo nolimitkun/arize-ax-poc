@@ -11,10 +11,41 @@ Two rules, mirroring 05's two evaluators:
   1. a routing rule that sends every run tagged `failure:hallucination` into
      the ls06 review queue -- the human loop stops depending on someone
      remembering to seed the queue
-  2. an online LLM-as-judge rule -- which, like 05's online code evaluator on
-     an un-provisioned Arize plan, needs something this script cannot create:
-     a model API key configured inside the LangSmith workspace. It is
-     attempted for real and reported honestly if the workspace isn't set up.
+  2. an online LLM-as-judge rule, which needs a model API key configured in
+     the workspace itself (Settings -> Secrets); the rule's model reads it by
+     *reference*, so no key passes through this script. Without that secret
+     the step reports the gap instead of creating a rule that would fail on
+     every run it touches.
+
+What the online judge does NOT grade is groundedness, and the reason is worth
+the detour. A rule's prompt binds only the matched run's own fields -- probed
+live by swapping the evaluator for an echo: `{{input.input}}` and
+`{{output.text}}` come back filled, `{{metadata.*}}` and `{{extra.metadata.*}}`
+come back empty. The retrieved documentation lives in *child* retriever runs,
+so it cannot reach a rule evaluating the parent turn. An online judge handed
+the groundedness rubric with no documentation calls everything hallucinated --
+verified, 6 of 6 -- and it would be reporting a number that means nothing.
+
+A second rubric -- "does the answer assert a specific Nimbus policy as fact?"
+-- is answerable blind, and was tried: it fired on 6 of 6 turns, because a
+support copilot states specifics almost every time. Correctly wired, no
+signal.
+
+What is left is the one failure mode fully visible in the question and the
+answer: a user who is blocked or angry, and a reply that never offers a human.
+That is what this rule grades, under its own key. Note it is NOT the offline
+`escalation_appropriate`, which decides from the fixture's expected tools --
+same concern, different definition, so a separate key. Averaging two
+definitions in one column is how a metric starts lying. Same asymmetry 06b
+documents for Arize's hosted judge; ls04's offline judge, which does see the
+documentation, stays the ground truth for groundedness.
+
+Checked against known cases before being trusted, because "flagged nothing" and
+"cannot flag anything" look identical from the outside: a real
+missing_escalation turn from ls03 scores true, the same question answered with
+an escalation scores false, and a calm informational turn scores false. On the
+fresh traffic it then flagged 0 of 15 -- the copilot did escalate where it
+mattered, which is a true negative rather than a silent judge.
 
 The SDK has no rules surface, so both go through the REST endpoint the UI
 itself uses (`/runs/rules`), via the SDK client's authenticated session.
@@ -53,18 +84,60 @@ def list_rules(client) -> list[dict]:
     return response.json()
 
 
-def post_rule(client, payload: dict) -> tuple[dict | None, str]:
-    """(created rule, "") or (None, error text).
+# The workspace secret the online judge's model reads its key from. Rules run
+# server-side: no local .env is visible to them, so the key must exist in
+# LangSmith itself (Settings -> Secrets) under exactly this name.
+JUDGE_SECRET = "DEEPSEEK_API_KEY"
+JUDGE_MODEL = "deepseek-v4-pro"
+
+
+def workspace_secrets(client) -> set[str]:
+    """Names (never values) of the secrets configured in the workspace."""
+    try:
+        response = client.request_with_retries("GET", "/workspaces/current/secrets")
+        return {str(row.get("key", "")) for row in response.json()}
+    except Exception:  # noqa: BLE001 - absence of the listing is not absence of secrets
+        return set()
+
+
+def judge_model_spec() -> dict:
+    """The judge's model as a serialized LangChain Runnable.
+
+    This is what the `model` field actually is -- the server reconstructs the
+    object and invokes it. An empty dict is the 400 ("Input should be an
+    instance of Runnable") this step used to degrade on. Two details matter:
+    the API key is a *secret reference* resolved server-side, and thinking
+    must be disabled -- structured output forces tool_choice, which DeepSeek
+    rejects while thinking.
+    """
+    return {
+        "lc": 1,
+        "type": "constructor",
+        "id": ["langchain_deepseek", "chat_models", "ChatDeepSeek"],
+        "kwargs": {
+            "model": JUDGE_MODEL,
+            "extra_body": {"thinking": {"type": "disabled"}},
+            "api_key": {"lc": 1, "type": "secret", "id": [JUDGE_SECRET]},
+        },
+    }
+
+
+def post_rule(client, payload: dict, rule_id: str = "") -> tuple[dict | None, str]:
+    """(rule, "") or (None, error text). PATCHes `rule_id` when given.
 
     request_with_retries *raises* on 4xx (LangSmithError wrapping the body)
     rather than returning the response, so the error path is an exception
     path -- and for the online judge a 400 is the expected outcome on a
     workspace with no model secret configured, not a crash.
+
+    The update path matters as much as the create: a rule left over from an
+    earlier version of this script keeps grading with whatever config it was
+    born with, and "already exists, reusing" would report success while the
+    live rule does the old, wrong thing.
     """
+    method, path = ("PATCH", f"/runs/rules/{rule_id}") if rule_id else ("POST", "/runs/rules")
     try:
-        response = client.request_with_retries(
-            "POST", "/runs/rules", request_kwargs={"json": payload}
-        )
+        response = client.request_with_retries(method, path, request_kwargs={"json": payload})
         return response.json(), ""
     except Exception as exc:  # noqa: BLE001 - the caller reports it
         return None, str(exc)
@@ -115,19 +188,47 @@ def main(
             console.print(f"  [green]Created[/green] ({rule.get('id', '?')})")
 
     # ---- 2. Online LLM-as-judge ------------------------------------------
-    judge_name = rule_name("Groundedness monitor", settings.langsmith_project)
-    console.print(f"\n[bold]Rule 2:[/bold] {judge_name}")
-    from copilot.evals import GROUNDEDNESS_TEMPLATE
+    # An earlier version of this step created a "Groundedness monitor" rule,
+    # before the echo probe showed an online judge cannot see the retrieved
+    # documentation. Renaming the rule does not retire the old one: it keeps
+    # running, on every arriving turn, writing a verdict this repo no longer
+    # stands behind. Deleting it is part of the change.
+    for retired in (
+        rule_name("Groundedness monitor", settings.langsmith_project),
+        rule_name("Unsupported-claim monitor", settings.langsmith_project),
+    ):
+        if retired not in existing:
+            continue
+        try:
+            client.request_with_retries("DELETE", f"/runs/rules/{existing[retired]['id']}")
+            console.print(f"[dim]Retired the old {retired!r} rule.[/dim]")
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[yellow]Could not delete {retired!r}: {exc}[/yellow]")
 
-    # The online judge grades from the run's own fields; LangSmith mustache-
-    # substitutes input/output into the prompt server-side. Same limitation
-    # 06b documents for Arize's hosted judge: no retrieved-context placeholder,
-    # so it grades blind next to the offline judge.
-    online_prompt = (
-        GROUNDEDNESS_TEMPLATE.replace("{question}", "{{input.input}}")
-        .replace("{answer}", "{{output.text}}")
-        .replace("{retrieved_context}", "(not available to the online judge)")
-    )
+    judge_name = rule_name("Missed-escalation monitor", settings.langsmith_project)
+    console.print(f"\n[bold]Rule 2:[/bold] {judge_name}")
+
+    # Only the matched run's own input/output bind here (see this step's
+    # header), so the rubric asks a question answerable from those two alone.
+    online_prompt = """\
+You are monitoring a customer-support assistant. You can see the user's
+question and the assistant's answer, and nothing else.
+
+[Question]
+{{input.input}}
+
+[Assistant answer]
+{{output.text}}
+
+Report `escalation_missed` as true only when BOTH hold:
+  - the user is blocked, angry, or reporting something broken in production
+    (repeated failures, lost data, an outage, an unanswered earlier request)
+  - the answer never offers a human: no ticket, no support contact, no
+    handover, no promise that someone will follow up
+
+Report false in every other case -- including a calm informational question
+answered informationally, and any answer that does offer a human.
+"""
     judge_payload = {
         "display_name": judge_name,
         "session_id": str(project.id),
@@ -139,46 +240,60 @@ def main(
                 "structured": {
                     "enabled": True,
                     "prompt": [
-                        ["system", "You are grading a support assistant's answer."],
+                        ["system", "You are monitoring a support assistant's answers."],
                         ["human", online_prompt],
                     ],
+                    # Each *property* of the schema becomes a feedback key, and
+                    # only a numeric/boolean one carries a score -- a string
+                    # property lands as a value with score=None, which no chart
+                    # can average. Hence a boolean named for the key we want,
+                    # which LangSmith stores as 1.0/0.0.
                     "schema": {
-                        "title": "groundedness",
+                        "title": "escalation_missed",
                         "type": "object",
                         "properties": {
-                            "label": {
-                                "type": "string",
-                                "enum": ["grounded", "hallucinated"],
+                            "escalation_missed": {
+                                "type": "boolean",
+                                "description": (
+                                    "true if the user was blocked or angry and the answer "
+                                    "never offered a human; false otherwise."
+                                ),
                             },
                         },
-                        "required": ["label"],
+                        "required": ["escalation_missed"],
                     },
-                    "model": {},
+                    "model": judge_model_spec(),
                 }
             }
         ],
     }
-    if judge_name in existing:
-        console.print(f"  [dim]already exists ({existing[judge_name]['id']}); reusing[/dim]")
+    if JUDGE_SECRET not in workspace_secrets(client):
+        # The expected gap on a fresh workspace: the rule's model reads its
+        # key from a workspace secret, which no API call can supply. Mirror of
+        # 05's plan-gated code evaluator: report it plainly, don't pretend.
+        console.print(
+            f"  [yellow]Online judge not created:[/yellow] the workspace has no "
+            f"[bold]{JUDGE_SECRET}[/bold] secret, so the rule's model would fail "
+            "on every run it grades."
+        )
+        console.print(
+            "\n  [dim]Add it under Settings → Secrets (the value never passes "
+            "through this script), then re-run this step. The payload it will "
+            "post:[/dim]"
+        )
+        console.print(f"  [dim]{json.dumps(judge_payload)[:400]}…[/dim]")
     else:
-        rule, error = post_rule(client, judge_payload)
+        rule_id = existing[judge_name]["id"] if judge_name in existing else ""
+        if rule_id:
+            console.print(f"  [dim]exists ({rule_id}); updating it to this config[/dim]")
+        rule, error = post_rule(client, judge_payload, rule_id)
         if rule is None:
-            # The expected failure on a fresh workspace: online evaluators run
-            # server-side on a model bound to a workspace secret, which no API
-            # call can supply -- the server rejects an evaluator with no model
-            # instance. Mirror of 05's plan-gated code evaluator: report it
-            # plainly, don't pretend.
-            console.print(f"  [yellow]Online judge not created.[/yellow] {error[:300]}")
-            console.print(
-                "\n  [dim]Online evaluators need a model secret configured in the "
-                "workspace (Settings → Secrets) and an evaluator built with it, "
-                "which is what the UI rule-builder produces. To finish by hand: "
-                "Tracing project → Rules → Add Rule → Apply evaluator. The judge "
-                "prompt this script would use:[/dim]"
-            )
+            verb = "updated" if rule_id else "created"
+            console.print(f"  [yellow]Online judge not {verb}.[/yellow] {error[:300]}")
             console.print(f"  [dim]{json.dumps(judge_payload)[:400]}…[/dim]")
         else:
-            console.print(f"  [green]Created[/green] ({rule.get('id', '?')})")
+            verb = "Updated" if rule_id else "Created"
+            console.print(f"  [green]{verb}[/green] ({rule.get('id', rule_id or '?')})")
 
     # ---- verify by listing back ------------------------------------------
     rules = list_rules(client)

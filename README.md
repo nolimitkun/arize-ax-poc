@@ -586,7 +586,7 @@ definition of every metric:
 | `ls03_query_runs` | 03 | `list_runs` + trajectory rebuilt from *child runs* (see below); failures become run tags |
 | `ls04_offline_evals` | 04 | same judges; results land as per-run feedback instead of `eval.*` columns |
 | `ls04b_thread_evals` | 04b | sessions group by `metadata.session_id` (LangSmith Threads); verdict on the closing run |
-| `ls05_online_rules` | 05 | automation rules via REST: route flagged runs to review; online judge needs a workspace model secret and says so if absent |
+| `ls05_online_rules` | 05 | automation rules via REST: route flagged runs to review, plus a live online judge whose model reads a *workspace* secret by reference (see below) |
 | `ls06_annotations` | 06 | native annotation queues; simulated labels as feedback; same agreement table |
 | `ls06b_align_judge` | 06b | same alignment + holdout proof; publishes to the Prompt Hub because LangSmith has no hosted-evaluator object |
 | `ls07_dataset` | 07 | datasets with splits; human verdicts merged into example metadata; every write is auto-versioned |
@@ -594,7 +594,7 @@ definition of every metric:
 | `ls09_prompt_hub` | 09 | commits + a moving `production` *tag* (vs Arize's labels); runtime side is `load_prompt("ls-hub")` |
 | `ls10_dashboards` | 10 | custom dashboard via REST, dry-run by default; alerting is UI-only and the step says so |
 
-Two findings worth knowing before reading the code. LangSmith's OTel ingest
+Three findings worth knowing before reading the code. LangSmith's OTel ingest
 **drops custom span attributes** (`copilot.*` never arrives), so ls03 rebuilds
 each turn's trajectory from its child runs — tool calls from `tool`-type
 children, `search_docs` inferred from the `kb.search` retriever child,
@@ -602,6 +602,23 @@ doc ids from the retriever's outputs. And it does not derive thread metadata
 from the `session.id` attribute, so both engines write `session_id` into span
 metadata as well — Arize reads the attribute, LangSmith Threads read the
 metadata, one turn feeds both.
+
+The third shapes what an online judge can be. An automation rule's prompt binds
+**only the matched run's own input and output** — probed live by swapping the
+evaluator for an echo: `{{input.input}}` and `{{output.text}}` come back
+filled, `{{metadata.*}}` and `{{extra.metadata.*}}` come back empty. The
+retrieved documentation lives in child runs, so it never reaches a rule
+grading the parent turn, and an online *groundedness* judge is therefore
+impossible on this trace shape: handed the rubric with no documentation it
+called 6 of 6 turns hallucinated. ls05 grades what the rule can actually see
+instead — missed escalations — under its own feedback key, with the offline
+judge left as the ground truth for groundedness. Two details cost a round of
+debugging each: the rule's `model` is a *serialized Runnable* whose api-key is
+a secret reference (`{"lc":1,"type":"secret","id":["DEEPSEEK_API_KEY"]}`), so
+the key lives in the workspace and never in this repo; and each **property**
+of the output schema becomes a feedback key, where only a boolean or number
+carries a score — a string property lands with `score=None` and no chart can
+average it.
 
 ## Notes on the build
 

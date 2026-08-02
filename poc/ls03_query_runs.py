@@ -78,6 +78,22 @@ def main(
 
     turns = turn_runs_to_df(roots, children)
     turns = turns.sort_values("start_time", kind="stable").reset_index(drop=True)
+
+    # Experiment targets are double-traced into this project (the ls08 caveat):
+    # every arm's answer_only call emits its own copilot.turn tree. Counting
+    # those as production traffic would feed ls07's dataset the experiment's
+    # own answers -- the analysis grading its own homework. The engine invents
+    # a session_id when none is given, so that can't be the filter; what only
+    # real traffic has is a caller-supplied user (01's personas, 02's demo
+    # user). Experiment and probe calls run as "anonymous".
+    experiment_turns = int((turns["user_id"].isin(["", "anonymous"])).sum())
+    if experiment_turns:
+        console.print(
+            f"[dim]Excluding {experiment_turns} anonymous turn(s) — experiment/"
+            "probe traffic double-traced into this project, not production "
+            "conversations.[/dim]\n"
+        )
+        turns = turns[~turns["user_id"].isin(["", "anonymous"])].reset_index(drop=True)
     if limit:
         turns = turns.head(limit)
 
@@ -144,22 +160,35 @@ def main(
 
     if not skip_tags:
         console.print("\nTagging the runs with what was found…")
-        try:
-            tagged = 0
-            for _, r in turns.iterrows():
-                modes = [m for m in r["failures"].split(",") if m]
-                # "failure:none" rather than no tag -- an untagged run is
-                # indistinguishable from an unexamined one, and "no failures"
-                # is a finding (the same reasoning as step 03's "none").
-                tags = [f"failure:{m}" for m in modes] or ["failure:none"]
+        tagged, already, errors = 0, 0, []
+        for _, r in turns.iterrows():
+            modes = [m for m in r["failures"].split(",") if m]
+            # "failure:none" rather than no tag -- an untagged run is
+            # indistinguishable from an unexamined one, and "no failures"
+            # is a finding (the same reasoning as step 03's "none").
+            tags = [f"failure:{m}" for m in modes] or ["failure:none"]
+            try:
                 client.update_run(r["span_id"], tags=tags)
                 tagged += 1
+            except Exception as exc:  # noqa: BLE001 - handled per run below
+                # The ingest API takes exactly one update per run: a run tagged
+                # on a previous pass answers 409 forever after. That is "still
+                # tagged", not a failure -- but it must not abort the loop, or
+                # one old run would silently cost every new run its tags.
+                if "409" in str(exc) or "Conflict" in type(exc).__name__:
+                    already += 1
+                else:
+                    errors.append(f"{type(exc).__name__}: {exc}")
+        console.print(
+            f"[green]Tagged {tagged} runs[/green] with `failure:*` — filterable "
+            "in the Runs table."
+            + (f" [dim]({already} kept tags from an earlier pass.)[/dim]" if already else "")
+        )
+        if errors:
             console.print(
-                f"[green]Tagged {tagged} runs[/green] with `failure:*` — filterable "
-                "in the Runs table."
+                f"[yellow]{len(errors)} run(s) could not be tagged.[/yellow] "
+                f"First error: {errors[0][:200]}"
             )
-        except Exception as exc:  # noqa: BLE001 - the query above is the real work
-            console.print(f"[yellow]Could not tag runs: {type(exc).__name__}: {exc}[/yellow]")
 
     look_at_ls(
         "Tracing Projects → the project → Runs: filter `Name = copilot.turn`, sort "

@@ -1527,6 +1527,35 @@ def check_langsmith_tour() -> None:
         and modules["ls10_dashboards"].section_name("proj").endswith("(proj)"),
     )
 
+    # The online judge's model must be a serialized Runnable (an empty dict is
+    # a 400), key by secret *reference*, and think-off (structured output
+    # forces tool_choice, which DeepSeek rejects mid-thinking).
+    spec = modules["ls05_online_rules"].judge_model_spec()
+    check(
+        "ls05 judge model spec: Runnable constructor, secret ref, thinking off",
+        spec.get("type") == "constructor"
+        and spec["kwargs"]["api_key"].get("type") == "secret"
+        and spec["kwargs"]["extra_body"] == {"thinking": {"type": "disabled"}},
+        str(spec)[:120],
+    )
+
+    # ls03 must not count double-traced experiment turns as production
+    # traffic: anonymous turns (no caller-supplied user) are excluded.
+    ls_common = modules["_ls_common"]
+    from types import SimpleNamespace as NS
+
+    anon_run = NS(
+        id="r1", trace_id="t1", start_time=1, error=None,
+        inputs={"input": "q"}, outputs={"text": "a"},
+        extra={"metadata": {"session_id": "sess-deadbeef", "user_id": "anonymous"}},
+    )
+    frame = ls_common.turn_runs_to_df([anon_run], {})
+    check(
+        "turn_runs_to_df exposes user_id so ls03 can drop anonymous turns",
+        list(frame["user_id"]) == ["anonymous"],
+        str(list(frame.columns)),
+    )
+
 
 def check_sdk_surface() -> None:
     console.print("\n[bold]SDK surface[/bold]")
