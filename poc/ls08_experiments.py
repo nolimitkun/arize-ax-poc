@@ -56,6 +56,67 @@ def wrap_evaluator(fn, key: str):
     return evaluator
 
 
+def iter_selected(selected, client, dataset: str):
+    """Examples to sample from for --dry-run, whichever form `selected` takes."""
+    if isinstance(selected, str):
+        return client.list_examples(dataset_name=selected)
+    return iter(selected)
+
+
+def select_batch(client, dataset: str, batch: str):
+    """The examples to measure: one traffic sample, or every one collected.
+
+    ls07 appends a batch per run, so by default this dataset answers "across
+    all the traffic we have kept" -- which silently becomes a different
+    question from "did this change help on what we just saw" as batches pile
+    up. `evaluate()` takes an example list, so scoping is a filter here; step
+    08 needs a whole dataset per batch because Arize's runner takes only a
+    dataset name.
+
+    Returns (data, description) where data is the dataset name (whole dataset)
+    or a list of examples.
+    """
+    if batch == "all":
+        return dataset, "every batch in the dataset"
+
+    examples = list(client.list_examples(dataset_name=dataset))
+
+    def stamp_of(example) -> str:
+        """This example's traffic sample, precise or inferred.
+
+        Examples written before ls07 stamped batches carry no marker, and
+        measuring "everything" on such a dataset is the blend this option
+        exists to avoid. Their creation date is a coarser but honest stand-in
+        -- a tour run lands its whole batch within one day -- so a dataset
+        built before this change is still scopeable, just at day resolution.
+        """
+        stamped = str((example.metadata or {}).get("batch", ""))
+        return stamped or f"{str(example.created_at)[:10]} (by date)"
+
+    stamps = sorted({stamp_of(e) for e in examples} - {""})
+    if not stamps:
+        console.print(
+            "[yellow]This dataset has no examples to scope.[/yellow] Measuring "
+            "all of it."
+        )
+        return dataset, "every batch in the dataset"
+
+    wanted = stamps[-1] if batch == "latest" else batch
+    picked = [e for e in examples if stamp_of(e) == wanted]
+    if not picked:
+        console.print(
+            f"[red]No examples in batch {wanted!r}.[/red] Known batches: "
+            f"{', '.join(stamps)}."
+        )
+        raise SystemExit(1)
+    console.print(
+        f"[dim]Measuring batch {wanted} — {len(picked)} of {len(examples)} examples "
+        f"({len(stamps)} batches in the dataset). `--batch all` for the blended "
+        f"view.[/dim]"
+    )
+    return picked, f"batch {wanted}"
+
+
 def to_frame(results) -> Any:
     """ExperimentResults -> the frame shape 08's compare() machinery expects.
 
@@ -75,6 +136,10 @@ def to_frame(results) -> Any:
 @app.command()
 def main(
     dataset: str = typer.Option("copilot-failures-ls", help="Dataset to run against"),
+    batch: str = typer.Option(
+        "latest",
+        help="Which traffic sample to measure: 'latest', 'all', or a ls07 batch stamp",
+    ),
     concurrency: int = typer.Option(4, help="Parallel task executions"),
     baseline: str = typer.Option("v1", help="Baseline prompt version"),
     candidate: str = typer.Option("v2", help="Candidate prompt version"),
@@ -100,6 +165,7 @@ def main(
 
     init_tracing(settings)
     client = ls_client(settings)
+    selected, scope = select_batch(client, dataset, batch)
     stamp = datetime.now(timezone.utc).strftime("%m%d-%H%M")
     summaries: dict[str, dict[str, float]] = {}
     frames: dict[str, Any] = {}
@@ -129,13 +195,11 @@ def main(
 
     for label, version, model, _ in arms:
         on = f" on [bold]{model}[/bold]" if model else ""
-        console.print(f"\n[bold cyan]Running {label}[/bold cyan]{on} against '{dataset}'…")
-        task = exp.build_task(settings, version, model)
-        data = (
-            list(islice(client.list_examples(dataset_name=dataset), 10))
-            if dry_run
-            else dataset
+        console.print(
+            f"\n[bold cyan]Running {label}[/bold cyan]{on} against '{dataset}' ({scope})…"
         )
+        task = exp.build_task(settings, version, model)
+        data = list(islice(iter_selected(selected, client, dataset), 10)) if dry_run else selected
         results = client.evaluate(
             lambda inputs, _task=task: _task(inputs),
             data=data,

@@ -1599,6 +1599,61 @@ def check_langsmith_tour() -> None:
         "observe.production_turns(" in ls03_source,
     )
 
+    # Both datasets accumulate a batch per run, so an experiment over the whole
+    # thing blends traffic samples. ls08 scopes by filtering examples; step 08
+    # cannot (Arize's runner takes a dataset name), so 07 publishes a dataset
+    # per batch instead. Check each does its own half.
+    ls08 = modules["ls08_experiments"]
+
+    def example(batch_value, created="2026-07-31 22:00:00+00:00"):
+        return NS(
+            metadata={"batch": batch_value} if batch_value else {},
+            created_at=created,
+        )
+
+    picked, scope = ls08.select_batch(
+        NS(list_examples=lambda dataset_name: [
+            example("20260731-2220"), example("20260802-0945"), example("20260802-0945"),
+        ]),
+        "copilot-failures-ls",
+        "latest",
+    )
+    check(
+        "ls08 --batch latest measures only the newest traffic sample",
+        len(picked) == 2 and "20260802-0945" in scope,
+        f"{len(picked)} examples, scope={scope!r}",
+    )
+    whole, all_scope = ls08.select_batch(NS(), "copilot-failures-ls", "all")
+    check(
+        "ls08 --batch all keeps the blended view",
+        whole == "copilot-failures-ls" and "every batch" in all_scope,
+    )
+    # A dataset built before batches existed is still scopeable, by the day its
+    # examples were created -- otherwise "latest" would silently mean "all" on
+    # exactly the datasets this option was added for.
+    legacy, legacy_scope = ls08.select_batch(
+        NS(list_examples=lambda dataset_name: [
+            example(None, "2026-08-01 10:00:00+00:00"),
+            example(None, "2026-08-02 09:00:00+00:00"),
+            example(None, "2026-08-02 09:05:00+00:00"),
+        ]),
+        "copilot-failures-ls",
+        "latest",
+    )
+    check(
+        "a pre-batch dataset scopes by creation date rather than measuring all",
+        len(legacy) == 2 and "2026-08-02" in legacy_scope,
+        f"{len(legacy) if not isinstance(legacy, str) else legacy} / {legacy_scope!r}",
+    )
+    check(
+        "step 07 publishes a run-scoped dataset, since Arize cannot filter rows",
+        'f"{name}-{batch}"' in Path(__file__).with_name("07_dataset.py").read_text(),
+    )
+    check(
+        "step 08 resolves --dataset latest to that run dataset",
+        "def resolve_dataset(" in Path(__file__).with_name("08_experiments.py").read_text(),
+    )
+
 
 def check_sdk_surface() -> None:
     console.print("\n[bold]SDK surface[/bold]")

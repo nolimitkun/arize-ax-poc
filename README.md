@@ -116,8 +116,8 @@ Run in order. Each script prints what to go and look at in the AX UI.
 | 05 | `poc/05_online_evals.py` | Evaluators + **continuous tasks** (sampling, filters) | [online judge](https://arize.com/docs/ax/concepts/evaluators/online-llm-as-judge) · [code evals](https://arize.com/docs/ax/concepts/evaluators/online-code-evaluators) |
 | 06 | `poc/06_annotations.py` | Annotation config, **review queue**, judge-vs-human agreement | [human review](https://arize.com/docs/ax/evaluate/human-review) · [align evals](https://arize.com/docs/ax/evaluate/align-evals-to-human-feedback) |
 | 06b | `poc/06b_align_judge.py` | **Align the judge** to human labels, prove it on a holdout, version the evaluator | [align evals](https://arize.com/docs/ax/evaluate/align-evals-to-human-feedback) |
-| 07 | `poc/07_dataset.py` | Dataset from failing traces (+ a control group), with the human review folded back in | [build a dataset](https://arize.com/docs/ax/improve/build-a-dataset) |
-| 08 | `poc/08_experiments.py` | **v1 vs v2, and pro vs flash, on identical inputs** — the payoff | [experiments](https://arize.com/docs/ax/improve/set-up-an-experiment) |
+| 07 | `poc/07_dataset.py` | Dataset from failing traces (+ a control group), with the human review folded back in, plus a dataset for this run alone | [build a dataset](https://arize.com/docs/ax/improve/build-a-dataset) |
+| 08 | `poc/08_experiments.py` | **v1 vs v2, and pro vs flash, on identical inputs** — the payoff; `--dataset latest` measures one traffic sample | [experiments](https://arize.com/docs/ax/improve/set-up-an-experiment) |
 | 09 | `poc/09_prompt_hub.py` | Publish, label `production`, load at runtime | [prompt hub](https://arize.com/docs/ax/concepts/prompts/prompt-hub) |
 | 10 | `poc/10_monitors.py` | Monitors, alerting, dashboards | [monitoring](https://arize.com/docs/ax/observe/production-monitoring) |
 
@@ -590,7 +590,7 @@ definition of every metric:
 | `ls06_annotations` | 06 | native annotation queues; simulated labels as feedback; same agreement table |
 | `ls06b_align_judge` | 06b | same alignment + holdout proof; publishes to the Prompt Hub because LangSmith has no hosted-evaluator object |
 | `ls07_dataset` | 07 | datasets with splits; human verdicts merged into example metadata; every write is auto-versioned |
-| `ls08_experiments` | 08 | `client.evaluate()` per arm; results renamed into 08's frame shape so the identical `compare()` runs |
+| `ls08_experiments` | 08 | `client.evaluate()` per arm; results renamed into 08's frame shape so the identical `compare()` runs; `--batch` scopes the measurement (see below) |
 | `ls09_prompt_hub` | 09 | commits + a moving `production` *tag* (vs Arize's labels); runtime side is `load_prompt("ls-hub")` |
 | `ls10_dashboards` | 10 | custom dashboard via REST, dry-run by default; alerting is UI-only and the step says so |
 
@@ -619,6 +619,36 @@ the key lives in the workspace and never in this repo; and each **property**
 of the output schema becomes a feedback key, where only a boolean or number
 carries a score — a string property lands with `score=None` and no chart can
 average it.
+
+### Which traffic an experiment is measuring
+
+Both step 07 and ls07 append a batch of examples every time the tour runs on
+new traffic, which is how coverage grows — and also how an experiment quietly
+stops answering the question you think it does. Run the tour three times and
+`copilot-failures` holds three traffic samples; the headline number is then a
+blend across all of them, not a verdict on the change you just made. This is
+not hypothetical: the run that prompted the option measured 155 examples of
+which only 86 were current, and v2's groundedness win was **stronger** on the
+86 alone (`14↑ 2↓, p=0.004`) than on the blend — the older rows were diluting
+it, so the accumulated dataset was hiding a real improvement rather than
+inventing one.
+
+Every example now records the batch it came from, and each tour scopes a
+measurement the way its platform allows:
+
+- **Step 08** takes `--dataset latest`. Arize's `experiments.run` accepts a
+  dataset *name* and no row filter, so step 07 publishes each run's examples
+  as their own `copilot-failures-<YYYYmmdd-HHMM>` dataset alongside the
+  cumulative one (`--no-per-run` to skip).
+- **ls08** takes `--batch latest | all | <stamp>`. LangSmith's `evaluate()`
+  accepts an example list, so one dataset and a metadata filter is enough.
+  Examples written before batches existed fall back to their creation date, so
+  a dataset built by an earlier version is still scopeable rather than
+  silently measuring everything.
+
+`--batch all` (or the plain cumulative dataset name) keeps the blended view,
+which is the right question when you want to know how the variants compare
+across all the traffic you have kept.
 
 ## Notes on the build
 

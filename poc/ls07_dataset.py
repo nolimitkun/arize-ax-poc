@@ -18,6 +18,8 @@ Docs: https://docs.smith.langchain.com/evaluation/how_to_guides/manage_datasets_
 
 from __future__ import annotations
 
+from collections import Counter
+from datetime import datetime, timezone
 from importlib import import_module
 
 import pandas as pd
@@ -69,9 +71,11 @@ def main(
         )
         raise SystemExit(1)
 
+    batch = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
     console.print(
         f"{len(failures)} failing turns + {len(passing)} controls "
-        f"= [bold]{len(failures) + len(passing)}[/bold] examples\n"
+        f"= [bold]{len(failures) + len(passing)}[/bold] examples "
+        f"[dim](batch {batch})[/dim]\n"
     )
 
     examples = []
@@ -95,6 +99,13 @@ def main(
                     "baseline_tool_calls": row["tool_calls"],
                     "source_span_id": row["span_id"],
                     "source_trace_id": row["trace_id"],
+                    # Which traffic sample this example came from, so ls08 can
+                    # measure one sample rather than every sample ever
+                    # collected. Step 07 needs a whole dataset per batch --
+                    # Arize's experiments.run takes a name and no row filter --
+                    # while LangSmith's evaluate() accepts an example list, so
+                    # here the same intent costs one metadata field.
+                    "batch": batch,
                 },
                 "split": "control" if row["selected_failure"] == "" else "failure",
             }
@@ -129,6 +140,24 @@ def main(
         console.print(f"[green]Added {len(fresh)} examples[/green] to {name}.")
     else:
         console.print(f"[green]All {len(examples)} examples are already in {name}[/green].")
+
+    # The dataset accumulates across runs, which is the point -- coverage
+    # grows -- but it means an experiment over the whole thing reports a
+    # number blended across traffic samples. Say how many samples are in
+    # there, so the blend is visible rather than assumed away.
+    batches = Counter(
+        str((e.metadata or {}).get("batch", "(unstamped)"))
+        for e in client.list_examples(dataset_name=name)
+    )
+    if len(batches) > 1:
+        spread = ", ".join(f"{k}={v}" for k, v in sorted(batches.items()))
+        console.print(
+            f"\n[dim]{name} now holds {sum(batches.values())} examples from "
+            f"{len(batches)} traffic samples: {spread}.\n"
+            f"poc/ls08_experiments.py --batch {batch} measures this run alone; "
+            "`--batch latest` finds it automatically, `--batch all` keeps the "
+            "blended view.[/dim]"
+        )
 
     flat = pd.DataFrame(
         {
