@@ -782,6 +782,42 @@ def check_span_metadata_enrichment() -> None:
     check("start_time is carried through for the session judge",
           '"start_time": find_col(' in source and '"start_time": span.get(' in source)
 
+    # Steps 08 and 09 re-trace the agent into the same project, so an export
+    # taken after them is part production traffic and part the experiment's
+    # own answers. Dropping the anonymous ones is what keeps step 07 from
+    # building a dataset out of the experiment it is supposed to judge.
+    import importlib
+
+    observe = importlib.import_module("03_query_spans")
+    frame = pd.DataFrame(
+        {
+            "user_id": ["u_ana", "anonymous", "u_pii_demo", "", "anonymous"],
+            "question": ["real", "experiment", "real", "probe", "experiment"],
+        }
+    )
+    kept, dropped = observe.production_turns(frame)
+    check(
+        "production_turns keeps named users and drops anonymous ones",
+        dropped == 3 and list(kept["user_id"]) == ["u_ana", "u_pii_demo"],
+        f"dropped={dropped} kept={list(kept['user_id'])}",
+    )
+    check(
+        "...and returns a clean index, so downstream .head(n) is not a lottery",
+        list(kept.index) == [0, 1],
+        str(list(kept.index)),
+    )
+    # The engine invents a session_id when the caller gives none, so a
+    # session-based filter would keep every experiment turn while looking fine.
+    untouched, none_dropped = observe.production_turns(
+        pd.DataFrame({"session_id": ["sess-a", "sess-b"]})
+    )
+    check(
+        "a frame with no user_id column passes through rather than emptying",
+        none_dropped == 0 and len(untouched) == 2,
+    )
+    check("step 03 applies the filter to its own export",
+          "production_turns(turns)" in source)
+
 
 def check_dataset_lifecycle() -> None:
     """A dataset that grows by a full copy per run silently triples every experiment."""
@@ -1337,6 +1373,7 @@ def check_langsmith_tour() -> None:
     console.print("\n[bold]LangSmith tour (poc/ls*.py)[/bold]")
     from datetime import datetime, timezone
     from importlib import import_module
+    from pathlib import Path
     from types import SimpleNamespace
 
     # Every ls-step imports cleanly (they import their Arize originals too,
@@ -1540,7 +1577,8 @@ def check_langsmith_tour() -> None:
     )
 
     # ls03 must not count double-traced experiment turns as production
-    # traffic: anonymous turns (no caller-supplied user) are excluded.
+    # traffic: anonymous turns (no caller-supplied user) are excluded, using
+    # step 03's predicate rather than a second copy of it.
     ls_common = modules["_ls_common"]
     from types import SimpleNamespace as NS
 
@@ -1554,6 +1592,11 @@ def check_langsmith_tour() -> None:
         "turn_runs_to_df exposes user_id so ls03 can drop anonymous turns",
         list(frame["user_id"]) == ["anonymous"],
         str(list(frame.columns)),
+    )
+    ls03_source = Path(__file__).with_name("ls03_query_runs.py").read_text()
+    check(
+        "ls03 filters with step 03's production_turns, not its own copy",
+        "observe.production_turns(" in ls03_source,
     )
 
 

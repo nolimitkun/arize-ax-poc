@@ -45,6 +45,37 @@ def find_col(df: pd.DataFrame, *candidates: str) -> str | None:
     return None
 
 
+# Callers that mean their traffic to be observed name a user; experiment and
+# probe callers do not, and land on run_turn's default.
+ANONYMOUS_USERS = ("", "anonymous")
+
+
+def production_turns(turns: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Drop experiment traffic; return (kept turns, how many were dropped).
+
+    Steps 08 and 09 re-run the agent against the same project, and each of
+    those turns emits its own `copilot.turn` tree. Counted as production
+    traffic they swamp the real turns, and step 07 then builds dataset
+    examples out of the experiment's own answers -- the analysis grading its
+    own homework.
+
+    The session id cannot be the filter: the engine invents one when no caller
+    supplies it, so experiment turns have session ids too. A caller-supplied
+    *user* is the thing only intentional traffic has (01's personas, 02's
+    u_pii_demo).
+
+    Shared with poc/ls03_query_runs.py, which faces the same contamination
+    from ls08 -- one definition of "is this real traffic", as with every other
+    check in this file.
+    """
+    if "user_id" not in turns.columns:
+        return turns, 0
+    anonymous = turns["user_id"].isin(ANONYMOUS_USERS)
+    if not anonymous.any():
+        return turns, 0
+    return turns[~anonymous].reset_index(drop=True), int(anonymous.sum())
+
+
 def as_list(value: Any) -> list[str]:
     """Span list-attributes come back as list, ndarray, JSON string, or NaN."""
     if value is None or (isinstance(value, float) and pd.isna(value)):
@@ -206,6 +237,7 @@ def main(
             agent_df, "attributes.copilot.prompt_version", "copilot.prompt_version"
         ),
         "session": find_col(agent_df, "attributes.session.id", "session.id"),
+        "user": find_col(agent_df, "attributes.user.id", "user.id"),
         # Carried purely so step 04b can order a conversation. The export
         # happens to come back chronologically today, but nothing documents
         # that -- `spans.list()` is explicitly *descending* -- and a transcript
@@ -247,6 +279,7 @@ def main(
                 "span_id": span.get(cols["span_id"], ""),
                 "trace_id": span.get(cols["trace_id"], ""),
                 "session_id": span.get(cols["session"], "") if cols["session"] else "",
+                "user_id": str(span.get(cols["user"], "") or "") if cols["user"] else "",
                 "question_id": meta.get("id", ""),
                 "question": question,
                 "answer": answer,
@@ -263,6 +296,20 @@ def main(
         )
 
     turns = pd.DataFrame(rows)
+    turns, experiment_turns = production_turns(turns)
+    if experiment_turns:
+        console.print(
+            f"[dim]Excluding {experiment_turns} anonymous turn(s) — experiment/"
+            "probe traffic traced into this project by steps 08 and 09, not "
+            "production conversations.[/dim]\n"
+        )
+    if turns.empty:
+        console.print(
+            "[red]Every turn was anonymous.[/red] Run poc/01_trace.py to generate "
+            "traffic with real users — an export containing only experiment runs "
+            "has nothing to observe."
+        )
+        raise SystemExit(1)
     if limit:
         turns = turns.head(limit)
 

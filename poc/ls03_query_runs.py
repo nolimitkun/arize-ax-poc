@@ -80,20 +80,16 @@ def main(
     turns = turns.sort_values("start_time", kind="stable").reset_index(drop=True)
 
     # Experiment targets are double-traced into this project (the ls08 caveat):
-    # every arm's answer_only call emits its own copilot.turn tree. Counting
-    # those as production traffic would feed ls07's dataset the experiment's
-    # own answers -- the analysis grading its own homework. The engine invents
-    # a session_id when none is given, so that can't be the filter; what only
-    # real traffic has is a caller-supplied user (01's personas, 02's demo
-    # user). Experiment and probe calls run as "anonymous".
-    experiment_turns = int((turns["user_id"].isin(["", "anonymous"])).sum())
+    # every arm's answer_only call emits its own copilot.turn tree, and feeding
+    # those to ls07 would build a dataset from the experiment's own answers.
+    # The predicate belongs to step 03 -- same contamination, same definition.
+    turns, experiment_turns = observe.production_turns(turns)
     if experiment_turns:
         console.print(
             f"[dim]Excluding {experiment_turns} anonymous turn(s) — experiment/"
             "probe traffic double-traced into this project, not production "
             "conversations.[/dim]\n"
         )
-        turns = turns[~turns["user_id"].isin(["", "anonymous"])].reset_index(drop=True)
     if limit:
         turns = turns.head(limit)
 
