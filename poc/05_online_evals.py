@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import typer
 
-from _common import arize_client, console, done, header, look_at, table
+from _common import arize_client, console, done, header, look_at, require_arize, table
 
 app = typer.Typer(add_completion=False)
 
@@ -239,6 +239,7 @@ def main(
         "Evaluate: online evaluators + continuous tasks",
         "online-llm-as-judge · online-code-evaluators · create-evaluators",
     )
+    require_arize(settings, "evaluators and online tasks")
 
     from arize.evaluators.types import (
         CustomCodeConfig,

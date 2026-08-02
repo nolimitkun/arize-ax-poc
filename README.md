@@ -116,8 +116,8 @@ Run in order. Each script prints what to go and look at in the AX UI.
 | 05 | `poc/05_online_evals.py` | Evaluators + **continuous tasks** (sampling, filters) | [online judge](https://arize.com/docs/ax/concepts/evaluators/online-llm-as-judge) · [code evals](https://arize.com/docs/ax/concepts/evaluators/online-code-evaluators) |
 | 06 | `poc/06_annotations.py` | Annotation config, **review queue**, judge-vs-human agreement | [human review](https://arize.com/docs/ax/evaluate/human-review) · [align evals](https://arize.com/docs/ax/evaluate/align-evals-to-human-feedback) |
 | 06b | `poc/06b_align_judge.py` | **Align the judge** to human labels, prove it on a holdout, version the evaluator | [align evals](https://arize.com/docs/ax/evaluate/align-evals-to-human-feedback) |
-| 07 | `poc/07_dataset.py` | Dataset from failing traces (+ a control group), with the human review folded back in | [build a dataset](https://arize.com/docs/ax/improve/build-a-dataset) |
-| 08 | `poc/08_experiments.py` | **v1 vs v2, and pro vs flash, on identical inputs** — the payoff | [experiments](https://arize.com/docs/ax/improve/set-up-an-experiment) |
+| 07 | `poc/07_dataset.py` | Dataset from failing traces (+ a control group), with the human review folded back in, plus a dataset for this run alone | [build a dataset](https://arize.com/docs/ax/improve/build-a-dataset) |
+| 08 | `poc/08_experiments.py` | **v1 vs v2, and pro vs flash, on identical inputs** — the payoff; `--dataset latest` measures one traffic sample | [experiments](https://arize.com/docs/ax/improve/set-up-an-experiment) |
 | 09 | `poc/09_prompt_hub.py` | Publish, label `production`, load at runtime | [prompt hub](https://arize.com/docs/ax/concepts/prompts/prompt-hub) |
 | 10 | `poc/10_monitors.py` | Monitors, alerting, dashboards | [monitoring](https://arize.com/docs/ax/observe/production-monitoring) |
 
@@ -474,6 +474,8 @@ src/copilot/
 poc/00..10_*.py           the tour, one script per feature area
 poc/02b, 04b, 06b         side paths: backfill, session evals, judge alignment
 poc/_common.py            console chrome, client, time windows, the McNemar test
+poc/ls02b..ls10_*.py      the same tour against LangSmith (see below)
+poc/_ls_common.py         the LangSmith plumbing: client, guard, run→frame
 ```
 
 Trace shape produced by one turn:
@@ -532,6 +534,121 @@ One DeepSeek quirk needed handling that the raw-SDK engine got for free:
 sends it back, and DeepSeek 400s a tool loop without it. `graph_agent.py`
 subclasses the model to echo the CoT on tool-calling assistant messages —
 `make check` asserts the echo offline.
+
+## Second backend: LangSmith
+
+Orthogonal to the engine choice, `COPILOT_OBSERVABILITY` picks where the traces
+go:
+
+```bash
+COPILOT_OBSERVABILITY=both make trace        # same spans, Arize and LangSmith at once
+COPILOT_OBSERVABILITY=langsmith make all     # LangSmith only; no Arize credentials needed
+```
+
+This is a fan-out, not a second tracing system. Both engines already emit one
+OpenTelemetry span set — the manual `copilot.turn`/TOOL spans plus the
+auto-instrumented LLM spans — so the backend decision is just which span
+processors sit on the one tracer provider. `arize` (the default) is exactly the
+old path; `both` adds a second OTLP lane into LangSmith's ingestion endpoint
+(authenticated by `x-api-key`, project named by the `Langsmith-Project` header,
+defaulting to the trace project name, `-lg` suffix included); `langsmith` skips
+the Arize wiring entirely. Tokens are counted once in every mode because the
+spans exist once. The deliberately *not* chosen alternative — LangSmith-native
+tracing via `LANGSMITH_TRACING` + callbacks — would only cover the LangGraph
+engine and would run parallel to OTel, splitting the trace tree between two
+systems.
+
+Steps 02b–10 drive Arize *platform* APIs and step aside cleanly under
+`langsmith`-only (skip banner, exit 0), so `make all` still completes.
+Credentials follow the same logic — a LangSmith-only run needs no `ARIZE_*`
+variables at all, and vice versa (`LANGSMITH_API_KEY`, from
+smith.langchain.com → Settings → API Keys; EU orgs also set
+`LANGSMITH_ENDPOINT=https://eu.api.smith.langchain.com`).
+
+### The LangSmith tour (poc/ls*.py)
+
+Each Arize platform step also has a LangSmith mirror, so both platforms run
+the *whole* loop, side by side, on the same traffic:
+
+```bash
+COPILOT_OBSERVABILITY=both make trace   # traffic both platforms can see
+make ls-all                             # ls03 → ls10 (make all runs the Arize side)
+```
+
+The mirrors import the originals' logic — failure definitions, judges, code
+evaluators, the alignment machinery, the paired McNemar comparison — and swap
+only the platform half, which keeps the two tours answerable to one
+definition of every metric:
+
+| LangSmith step | mirrors | what changes |
+|---|---|---|
+| `ls02b_log_runs` | 02b | `batch_ingest_runs` instead of `spans.log()`; verdicts arrive as feedback |
+| `ls03_query_runs` | 03 | `list_runs` + trajectory rebuilt from *child runs* (see below); failures become run tags |
+| `ls04_offline_evals` | 04 | same judges; results land as per-run feedback instead of `eval.*` columns |
+| `ls04b_thread_evals` | 04b | sessions group by `metadata.session_id` (LangSmith Threads); verdict on the closing run |
+| `ls05_online_rules` | 05 | automation rules via REST: route flagged runs to review, plus a live online judge whose model reads a *workspace* secret by reference (see below) |
+| `ls06_annotations` | 06 | native annotation queues; simulated labels as feedback; same agreement table |
+| `ls06b_align_judge` | 06b | same alignment + holdout proof; publishes to the Prompt Hub because LangSmith has no hosted-evaluator object |
+| `ls07_dataset` | 07 | datasets with splits; human verdicts merged into example metadata; every write is auto-versioned |
+| `ls08_experiments` | 08 | `client.evaluate()` per arm; results renamed into 08's frame shape so the identical `compare()` runs; `--batch` scopes the measurement (see below) |
+| `ls09_prompt_hub` | 09 | commits + a moving `production` *tag* (vs Arize's labels); runtime side is `load_prompt("ls-hub")` |
+| `ls10_dashboards` | 10 | custom dashboard via REST, dry-run by default; alerting is UI-only and the step says so |
+
+Three findings worth knowing before reading the code. LangSmith's OTel ingest
+**drops custom span attributes** (`copilot.*` never arrives), so ls03 rebuilds
+each turn's trajectory from its child runs — tool calls from `tool`-type
+children, `search_docs` inferred from the `kb.search` retriever child,
+doc ids from the retriever's outputs. And it does not derive thread metadata
+from the `session.id` attribute, so both engines write `session_id` into span
+metadata as well — Arize reads the attribute, LangSmith Threads read the
+metadata, one turn feeds both.
+
+The third shapes what an online judge can be. An automation rule's prompt binds
+**only the matched run's own input and output** — probed live by swapping the
+evaluator for an echo: `{{input.input}}` and `{{output.text}}` come back
+filled, `{{metadata.*}}` and `{{extra.metadata.*}}` come back empty. The
+retrieved documentation lives in child runs, so it never reaches a rule
+grading the parent turn, and an online *groundedness* judge is therefore
+impossible on this trace shape: handed the rubric with no documentation it
+called 6 of 6 turns hallucinated. ls05 grades what the rule can actually see
+instead — missed escalations — under its own feedback key, with the offline
+judge left as the ground truth for groundedness. Two details cost a round of
+debugging each: the rule's `model` is a *serialized Runnable* whose api-key is
+a secret reference (`{"lc":1,"type":"secret","id":["DEEPSEEK_API_KEY"]}`), so
+the key lives in the workspace and never in this repo; and each **property**
+of the output schema becomes a feedback key, where only a boolean or number
+carries a score — a string property lands with `score=None` and no chart can
+average it.
+
+### Which traffic an experiment is measuring
+
+Both step 07 and ls07 append a batch of examples every time the tour runs on
+new traffic, which is how coverage grows — and also how an experiment quietly
+stops answering the question you think it does. Run the tour three times and
+`copilot-failures` holds three traffic samples; the headline number is then a
+blend across all of them, not a verdict on the change you just made. This is
+not hypothetical: the run that prompted the option measured 155 examples of
+which only 86 were current, and v2's groundedness win was **stronger** on the
+86 alone (`14↑ 2↓, p=0.004`) than on the blend — the older rows were diluting
+it, so the accumulated dataset was hiding a real improvement rather than
+inventing one.
+
+Every example now records the batch it came from, and each tour scopes a
+measurement the way its platform allows:
+
+- **Step 08** takes `--dataset latest`. Arize's `experiments.run` accepts a
+  dataset *name* and no row filter, so step 07 publishes each run's examples
+  as their own `copilot-failures-<YYYYmmdd-HHMM>` dataset alongside the
+  cumulative one (`--no-per-run` to skip).
+- **ls08** takes `--batch latest | all | <stamp>`. LangSmith's `evaluate()`
+  accepts an example list, so one dataset and a metadata filter is enough.
+  Examples written before batches existed fall back to their creation date, so
+  a dataset built by an earlier version is still scopeable rather than
+  silently measuring everything.
+
+`--batch all` (or the plain cumulative dataset name) keeps the blended view,
+which is the right question when you want to know how the variants compare
+across all the traffic you have kept.
 
 ## Notes on the build
 

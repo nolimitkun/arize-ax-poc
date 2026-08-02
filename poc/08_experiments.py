@@ -28,7 +28,7 @@ from typing import Any
 
 import typer
 
-from _common import console, done, header, look_at, mcnemar_p, table
+from _common import console, done, header, look_at, mcnemar_p, require_arize, table
 
 app = typer.Typer(add_completion=False)
 
@@ -94,6 +94,48 @@ def build_task(settings, version: str, model: str | None = None):
         }
 
     return task
+
+
+RUN_DATASET_PREFIX = "copilot-failures-"
+
+
+def resolve_dataset(client, space: str, requested: str) -> str:
+    """Turn `latest` into step 07's newest run dataset; pass anything else through.
+
+    The cumulative `copilot-failures` accumulates every batch the tour has ever
+    collected, so an experiment over it answers "how do the variants compare
+    across all traffic we have kept" -- a fair question, but not the same one
+    as "did this change help on the traffic we just saw". `latest` asks the
+    second. Step 07 names its run datasets `copilot-failures-<YYYYmmdd-HHMM>`,
+    which sorts chronologically as a string.
+    """
+    if requested != "latest":
+        return requested
+    try:
+        response = client.datasets.list(space=space, limit=50)
+    except Exception as exc:  # noqa: BLE001 - fall back rather than fail the run
+        console.print(f"[yellow]Could not list datasets ({exc}); using the cumulative one.[/yellow]")
+        return "copilot-failures"
+
+    names = []
+    for _key, value in response:
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            data = item.model_dump() if hasattr(item, "model_dump") else dict(item)
+            name = str(data.get("name", ""))
+            if name.startswith(RUN_DATASET_PREFIX):
+                names.append(name)
+    if not names:
+        console.print(
+            "[yellow]No run datasets found[/yellow] — run poc/07_dataset.py to create "
+            "one. Falling back to the cumulative `copilot-failures`, which blends "
+            "every batch collected so far."
+        )
+        return "copilot-failures"
+    latest = sorted(names)[-1]
+    console.print(f"[dim]--dataset latest → {latest} (of {len(names)} run datasets)[/dim]")
+    return latest
 
 
 def answer_of(output) -> str:
@@ -356,7 +398,7 @@ def compare(base_key: str, cand_key: str, summaries: dict, frames: dict) -> None
         console.print(
             f"[bold]No measurable difference[/bold] between {base_key} and {cand_key}. "
             f"Nothing moved beyond noise on {len(base_df) if base_df is not None else 0} "
-            f"rows.{trailer} Read the per-row explanations in the Arize experiment view "
+            f"rows.{trailer} Read the per-row explanations in the experiment view "
             "before changing anything again — and note that a bigger dataset raises "
             "what this test can detect.\n"
         )
@@ -364,7 +406,10 @@ def compare(base_key: str, cand_key: str, summaries: dict, frames: dict) -> None
 
 @app.command()
 def main(
-    dataset: str = typer.Option("copilot-failures", help="Dataset to run against"),
+    dataset: str = typer.Option(
+        "copilot-failures",
+        help="Dataset to run against; 'latest' picks step 07's newest run dataset",
+    ),
     concurrency: int = typer.Option(4, help="Parallel task executions"),
     baseline: str = typer.Option("v1", help="Baseline prompt version"),
     candidate: str = typer.Option("v2", help="Candidate prompt version"),
@@ -383,6 +428,7 @@ def main(
         "Improve: prompt and model variants against one baseline",
         "set-up-an-experiment · experiment-in-code · run-evals-on-experiments",
     )
+    require_arize(settings, "experiments")
 
     from _common import arize_client
     from copilot.config import AGENT_MODEL
@@ -390,6 +436,7 @@ def main(
 
     init_tracing(settings)
     client = arize_client(settings)
+    dataset = resolve_dataset(client, settings.arize_space_name, dataset)
     stamp = datetime.now(timezone.utc).strftime("%m%d-%H%M")
     summaries: dict[str, dict[str, float]] = {}
     frames: dict[str, Any] = {}

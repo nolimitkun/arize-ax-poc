@@ -80,12 +80,56 @@ def system_text(published) -> str:
     return "\n\n".join(parts)
 
 
+def ls_system_text(prompt_template) -> str:
+    """Pull the system text out of what `pull_prompt` returns.
+
+    LangSmith hands back a langchain `ChatPromptTemplate`; the system prompt
+    lives on each SystemMessagePromptTemplate's `.prompt.template`. Structural
+    rather than isinstance so this stays assertable offline in poc/00 without
+    constructing the real classes.
+    """
+    parts = []
+    for message in getattr(prompt_template, "messages", None) or []:
+        inner = getattr(message, "prompt", None)
+        if "system" in type(message).__name__.lower() and inner is not None:
+            template = getattr(inner, "template", "")
+            if template:
+                parts.append(template)
+    return "\n\n".join(parts)
+
+
+def _load_ls_hub(cfg, strict: bool) -> str:
+    """`production`-tagged commit from LangSmith's Prompt Hub (poc/ls09)."""
+    try:
+        from langsmith import Client
+
+        # api_url from settings, not the default: LangSmith keys are
+        # region-scoped and the US host answers an EU key with 403.
+        client = Client(api_key=cfg.langsmith_api_key, api_url=cfg.langsmith_base_url)
+        published = client.pull_prompt(f"{PROMPT_NAME}:production")
+        text = ls_system_text(published)
+        if not text.strip():
+            raise ValueError("published prompt has no system message")
+        print(f"[prompts] loaded '{PROMPT_NAME}' @ production from LangSmith Prompt Hub")
+        return text
+    except Exception as exc:  # noqa: BLE001 - fallback is the point
+        if strict:
+            raise
+        print(
+            f"[prompts] could not load '{PROMPT_NAME}' @ production from LangSmith "
+            f"({exc}); falling back to local V2. Run poc/ls09_prompt_hub.py to publish it.",
+            file=sys.stderr,
+        )
+        return V2
+
+
 def load_prompt(version: str, *, settings=None, strict: bool = False) -> str:
     """Resolve a system prompt.
 
     `v1` / `v2` come from this file. `hub` fetches the `production`-labelled
-    version from Arize Prompt Hub, falling back to V2 with a warning if the
-    prompt has not been published yet (i.e. poc/09 has not run).
+    version from Arize Prompt Hub; `ls-hub` fetches the `production`-tagged
+    commit from LangSmith's Prompt Hub. Both fall back to V2 with a warning if
+    the prompt has not been published yet (i.e. poc/09 / poc/ls09 has not run).
 
     `strict=True` raises instead of falling back. Serving traffic wants the
     fallback -- a Prompt Hub outage shouldn't take the agent down. A script
@@ -95,12 +139,16 @@ def load_prompt(version: str, *, settings=None, strict: bool = False) -> str:
     version = (version or "v1").lower()
     if version in _LOCAL:
         return _LOCAL[version]
-    if version != "hub":
-        raise ValueError(f"Unknown prompt version {version!r}; expected v1, v2, or hub")
+    if version not in ("hub", "ls-hub"):
+        raise ValueError(
+            f"Unknown prompt version {version!r}; expected v1, v2, hub, or ls-hub"
+        )
 
     from .config import platform_client, settings_or_exit
 
     cfg = settings or settings_or_exit()
+    if version == "ls-hub":
+        return _load_ls_hub(cfg, strict)
     try:
         # Region matters here: an EU key against the default host fails auth,
         # and the fallback below would report that as "not published yet" while

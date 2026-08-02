@@ -38,17 +38,42 @@ class Settings:
     arize_ai_integration_id: str | None
     prompt_version: str
     impl: str = "sdk"
+    observability: str = "arize"
+    langsmith_api_key: str = ""
+    langsmith_project: str = ""
+    langsmith_base_url: str = "https://api.smith.langchain.com"
 
     @property
     def app_url(self) -> str:
         return f"https://app.arize.com/organizations/-/spaces/{self.arize_space_id}"
 
+    @property
+    def arize_enabled(self) -> bool:
+        return self.observability != "langsmith"
 
-_REQUIRED = {
+    @property
+    def langsmith_enabled(self) -> bool:
+        return self.observability != "arize"
+
+    @property
+    def langsmith_otlp_endpoint(self) -> str:
+        # LangSmith's OTel ingestion lives under the API host; the base URL is
+        # the same LANGSMITH_ENDPOINT the langsmith SDK reads (EU:
+        # https://eu.api.smith.langchain.com).
+        return f"{self.langsmith_base_url.rstrip('/')}/otel/v1/traces"
+
+
+# DEEPSEEK is required in every mode -- it is the model under observation.
+# The platform keys are required only when their platform is enabled, so a
+# LangSmith-only run needs no Arize credentials and vice versa.
+_ARIZE_REQUIRED = {
     "ARIZE_API_KEY": "Arize Space Settings -> API Keys",
     "ARIZE_SPACE_ID": "Arize Space Settings -> Space ID",
     "ARIZE_SPACE_NAME": "the space's display name, shown in the Arize sidebar",
-    "DEEPSEEK_API_KEY": "https://platform.deepseek.com -> API keys",
+}
+
+_LANGSMITH_REQUIRED = {
+    "LANGSMITH_API_KEY": "https://smith.langchain.com -> Settings -> API Keys",
 }
 
 # DeepSeek speaks the OpenAI chat-completions protocol, so the whole app talks
@@ -118,8 +143,29 @@ def _resolve_impl() -> str:
     return impl
 
 
+# Where the spans go. Both engines emit one OTel span set (manual AGENT/TOOL
+# spans plus the auto-instrumented LLM spans), so the backend is a fan-out
+# decision, not a second tracing system: "both" exports the same spans to
+# Arize and LangSmith at once, and tokens are still counted once.
+_OBS_MODES = ("arize", "langsmith", "both")
+
+
+def _resolve_observability() -> str:
+    obs = os.getenv("COPILOT_OBSERVABILITY", "arize").strip().lower()
+    if obs not in _OBS_MODES:
+        raise ConfigError(
+            f"COPILOT_OBSERVABILITY={obs!r} is not one of {', '.join(_OBS_MODES)}."
+        )
+    return obs
+
+
 def load_settings() -> Settings:
-    missing = [f"  {name:<22} ({where})" for name, where in _REQUIRED.items() if not os.getenv(name)]
+    observability = _resolve_observability()
+    required = dict(_ARIZE_REQUIRED) if observability != "langsmith" else {}
+    if observability != "arize":
+        required.update(_LANGSMITH_REQUIRED)
+    required["DEEPSEEK_API_KEY"] = "https://platform.deepseek.com -> API keys"
+    missing = [f"  {name:<22} ({where})" for name, where in required.items() if not os.getenv(name)]
     if missing:
         raise ConfigError(
             "Missing required environment variables:\n"
@@ -135,9 +181,9 @@ def load_settings() -> Settings:
     if impl == "langgraph" and not project_name.endswith("-lg"):
         project_name = f"{project_name}-lg"
     return Settings(
-        arize_api_key=os.environ["ARIZE_API_KEY"],
-        arize_space_id=os.environ["ARIZE_SPACE_ID"],
-        arize_space_name=os.environ["ARIZE_SPACE_NAME"],
+        arize_api_key=os.getenv("ARIZE_API_KEY", ""),
+        arize_space_id=os.getenv("ARIZE_SPACE_ID", ""),
+        arize_space_name=os.getenv("ARIZE_SPACE_NAME", ""),
         arize_project_name=project_name,
         arize_region=region,
         arize_otlp_endpoint=_resolve_otlp_endpoint(region),
@@ -146,6 +192,12 @@ def load_settings() -> Settings:
         arize_ai_integration_id=os.getenv("ARIZE_AI_INTEGRATION_ID") or None,
         prompt_version=os.getenv("COPILOT_PROMPT_VERSION", "v1"),
         impl=impl,
+        observability=observability,
+        langsmith_api_key=os.getenv("LANGSMITH_API_KEY", ""),
+        # LangSmith projects are flat (no space above them), so the trace
+        # project name -- -lg suffix included -- is reused unless overridden.
+        langsmith_project=os.getenv("LANGSMITH_PROJECT") or project_name,
+        langsmith_base_url=os.getenv("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com"),
     )
 
 

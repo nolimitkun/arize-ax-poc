@@ -26,14 +26,16 @@ from __future__ import annotations
 import pandas as pd
 import typer
 
-from _common import arize_client, console, done, header, load, look_at, save, table
+from _common import arize_client, console, done, header, load, look_at, require_arize, save, table
 
 app = typer.Typer(add_completion=False)
 
 SESSION_EVAL = "session_outcome"
 
 
-def with_turn_verdicts(turns: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+def with_turn_verdicts(
+    turns: pd.DataFrame, evals_name: str = "04_evals.parquet"
+) -> tuple[pd.DataFrame, list[str]]:
     """Add `turn_failed`: did anything at all flag this turn?
 
     Step 03's `is_failure` alone is far too narrow for the claim this step
@@ -54,13 +56,13 @@ def with_turn_verdicts(turns: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     sources = ["step 03 heuristics"]
 
     try:
-        evals = load("04_evals.parquet")
+        evals = load(evals_name)
     except SystemExit:
         console.print(
-            "[yellow]No 04_evals.parquet — falling back to step 03's heuristics "
+            f"[yellow]No {evals_name} — falling back to step 03's heuristics "
             "alone.[/yellow] [dim]They flag a fraction of what the evaluators do, so "
-            "the silent-session count below would be overstated. Run "
-            "poc/04_offline_evals.py first.[/dim]\n"
+            "the silent-session count below would be overstated. Run the offline "
+            "evals step first.[/dim]\n"
         )
         return merged, sources
 
@@ -148,6 +150,7 @@ def main(
         "Evaluate: session-level outcomes over whole conversations",
         "sessions-and-users · run-evals-on-traces",
     )
+    require_arize(settings, "session-level span export")
 
     from copilot.evals import SESSION_CHOICES, judge_session
 

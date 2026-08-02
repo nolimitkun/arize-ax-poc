@@ -27,10 +27,12 @@ Docs: https://arize.com/docs/ax/improve/build-a-dataset
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pandas as pd
 import typer
 
-from _common import arize_client, console, done, header, load, look_at, save, table
+from _common import arize_client, console, done, header, load, look_at, require_arize, save, table
 
 app = typer.Typer(add_completion=False)
 
@@ -49,7 +51,7 @@ from copilot.evals import TURN_FAILURE_EVALS as FAILING_EVALS  # noqa: E402
 SELECTION_EVALS = ("eval.groundedness.score", "eval.conciseness.score")
 
 
-def merge_eval_verdicts(turns):
+def merge_eval_verdicts(turns, evals_name: str = "04_evals.parquet"):
     """Attach step 04's verdicts and derive `selected_failure` per turn.
 
     Falls back to step 03's `is_failure` heuristics when no eval results are
@@ -57,11 +59,11 @@ def merge_eval_verdicts(turns):
     but the eval path is the one that finds the real failures.
     """
     try:
-        evals = load("04_evals.parquet")
+        evals = load(evals_name)
     except SystemExit:
         console.print(
-            "[yellow]No 04_evals.parquet — falling back to step 03's heuristics.[/yellow]\n"
-            "[dim]Run poc/04_offline_evals.py for a dataset built from eval verdicts.[/dim]"
+            f"[yellow]No {evals_name} — falling back to step 03's heuristics.[/yellow]\n"
+            "[dim]Run the offline-evals step for a dataset built from eval verdicts.[/dim]"
         )
         turns = turns.copy()
         turns["selected_failure"] = turns.apply(
@@ -252,12 +254,18 @@ def main(
     new_version: str = typer.Option(
         "", help="Name a new dataset version for the human-review merge (default: in place)"
     ),
+    per_run: bool = typer.Option(
+        True,
+        help="Also publish this run's examples as their own dataset, so step 08 "
+        "can measure one traffic sample instead of every sample ever collected",
+    ),
 ) -> None:
     settings = header(
         "07",
         "Improve: build a dataset from the failing traces",
         "build-a-dataset",
     )
+    require_arize(settings, "datasets")
 
     from copilot.agent import load_questions
 
@@ -276,9 +284,11 @@ def main(
         )
         raise SystemExit(1)
 
+    batch = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
     console.print(
         f"{len(failures)} failing turns + {len(passing)} controls "
-        f"= [bold]{len(failures) + len(passing)}[/bold] examples\n"
+        f"= [bold]{len(failures) + len(passing)}[/bold] examples "
+        f"[dim](batch {batch})[/dim]\n"
     )
 
     examples = []
@@ -304,6 +314,11 @@ def main(
                 "baseline_tool_calls": row["tool_calls"],
                 "source_span_id": row["span_id"],
                 "source_trace_id": row["trace_id"],
+                # Which traffic sample this example came from. The cumulative
+                # dataset mixes eras -- an experiment over it blends today's
+                # traffic with every earlier run's -- and without this field
+                # there is no way to tell afterwards which rows were which.
+                "batch": batch,
             }
         )
 
@@ -342,6 +357,41 @@ def main(
                 "— nothing appended."
             )
         dataset = client.datasets.get(dataset=name, space=settings.arize_space_name)
+
+    # ---- this run's own dataset -----------------------------------------
+    # The cumulative dataset above is the coverage story: it keeps every
+    # example this tour has ever produced, and grows by a batch each time new
+    # traffic arrives. That is useful, and it is also why an experiment over
+    # it reports a number blended across traffic samples -- on the run that
+    # prompted this, 155 examples of which only 86 were the current traffic.
+    #
+    # Arize's experiments.run takes a dataset *name* and no row filter, so
+    # scoping a measurement to one sample means giving that sample its own
+    # dataset. (ls07 solves the same problem by filtering on the batch field,
+    # because LangSmith's evaluate() accepts an example list -- same intent,
+    # different mechanism.)
+    run_dataset = f"{name}-{batch}"
+    if per_run:
+        try:
+            scoped = client.datasets.create(
+                name=run_dataset,
+                space=settings.arize_space_name,
+                examples=examples,
+            )
+            console.print(
+                f"[green]Created run dataset[/green] {run_dataset} "
+                f"({getattr(scoped, 'id', '?')}) with {len(examples)} examples — "
+                "one traffic sample, nothing older."
+            )
+            console.print(
+                f"  [dim]poc/08_experiments.py --dataset {run_dataset}[/dim] measures "
+                "this run alone; [dim]--dataset latest[/dim] finds it automatically."
+            )
+        except Exception as exc:  # noqa: BLE001 - a re-run within the same minute
+            console.print(
+                f"[yellow]Run dataset {run_dataset} not created:[/yellow] "
+                f"{str(exc)[:200]}"
+            )
 
     df = pd.DataFrame(examples)
     save("07_dataset.parquet", df)

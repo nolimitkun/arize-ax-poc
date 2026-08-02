@@ -782,6 +782,42 @@ def check_span_metadata_enrichment() -> None:
     check("start_time is carried through for the session judge",
           '"start_time": find_col(' in source and '"start_time": span.get(' in source)
 
+    # Steps 08 and 09 re-trace the agent into the same project, so an export
+    # taken after them is part production traffic and part the experiment's
+    # own answers. Dropping the anonymous ones is what keeps step 07 from
+    # building a dataset out of the experiment it is supposed to judge.
+    import importlib
+
+    observe = importlib.import_module("03_query_spans")
+    frame = pd.DataFrame(
+        {
+            "user_id": ["u_ana", "anonymous", "u_pii_demo", "", "anonymous"],
+            "question": ["real", "experiment", "real", "probe", "experiment"],
+        }
+    )
+    kept, dropped = observe.production_turns(frame)
+    check(
+        "production_turns keeps named users and drops anonymous ones",
+        dropped == 3 and list(kept["user_id"]) == ["u_ana", "u_pii_demo"],
+        f"dropped={dropped} kept={list(kept['user_id'])}",
+    )
+    check(
+        "...and returns a clean index, so downstream .head(n) is not a lottery",
+        list(kept.index) == [0, 1],
+        str(list(kept.index)),
+    )
+    # The engine invents a session_id when the caller gives none, so a
+    # session-based filter would keep every experiment turn while looking fine.
+    untouched, none_dropped = observe.production_turns(
+        pd.DataFrame({"session_id": ["sess-a", "sess-b"]})
+    )
+    check(
+        "a frame with no user_id column passes through rather than emptying",
+        none_dropped == 0 and len(untouched) == 2,
+    )
+    check("step 03 applies the filter to its own export",
+          "production_turns(turns)" in source)
+
 
 def check_dataset_lifecycle() -> None:
     """A dataset that grows by a full copy per run silently triples every experiment."""
@@ -998,6 +1034,183 @@ def check_region_wiring() -> None:
         )
 
 
+def check_observability() -> None:
+    """COPILOT_OBSERVABILITY fans the same spans out to Arize and/or LangSmith.
+
+    The trap this guards: a mode that silently demands credentials it doesn't
+    use (or skips ones it does), and Arize-platform steps crashing instead of
+    stepping aside when Arize is disabled. All offline.
+    """
+    console.print("\n[bold]Observability backends (COPILOT_OBSERVABILITY)[/bold]")
+    import os
+
+    from _common import require_arize
+
+    from copilot.config import ConfigError, Settings, load_settings
+    from copilot.tracing import _langsmith_processor
+
+    env_keys = (
+        "ARIZE_API_KEY", "ARIZE_SPACE_ID", "ARIZE_SPACE_NAME", "DEEPSEEK_API_KEY",
+        "ARIZE_PROJECT_NAME", "LANGSMITH_API_KEY", "LANGSMITH_PROJECT",
+        "LANGSMITH_ENDPOINT", "COPILOT_OBSERVABILITY", "COPILOT_IMPL",
+    )
+    saved = {k: os.environ.get(k) for k in env_keys}
+
+    def load_with(**env: str):
+        for key in env_keys:
+            os.environ.pop(key, None)
+        os.environ.update(env)
+        return load_settings()
+
+    try:
+        try:
+            load_with(COPILOT_OBSERVABILITY="phoenix", DEEPSEEK_API_KEY="x")
+            check("an unknown mode is rejected", False)
+        except ConfigError as exc:
+            check("an unknown mode is rejected", "phoenix" in str(exc), str(exc))
+
+        try:
+            load_with(COPILOT_OBSERVABILITY="langsmith", DEEPSEEK_API_KEY="x")
+            check("langsmith mode still requires LANGSMITH_API_KEY", False)
+        except ConfigError as exc:
+            check(
+                "langsmith mode still requires LANGSMITH_API_KEY",
+                "LANGSMITH_API_KEY" in str(exc) and "ARIZE_API_KEY" not in str(exc),
+                str(exc),
+            )
+
+        # LangSmith-only: no Arize credentials needed at all.
+        ls = load_with(
+            COPILOT_OBSERVABILITY="langsmith", DEEPSEEK_API_KEY="x",
+            LANGSMITH_API_KEY="x", ARIZE_PROJECT_NAME="proj",
+        )
+        check(
+            "langsmith mode loads without any ARIZE_* variables",
+            not ls.arize_enabled and ls.langsmith_enabled and ls.arize_api_key == "",
+        )
+        check(
+            "...and the LangSmith project inherits the trace project name",
+            ls.langsmith_project == "proj",
+            ls.langsmith_project,
+        )
+
+        lg = load_with(
+            COPILOT_OBSERVABILITY="langsmith", COPILOT_IMPL="langgraph",
+            DEEPSEEK_API_KEY="x", LANGSMITH_API_KEY="x", ARIZE_PROJECT_NAME="proj",
+        )
+        check(
+            "...including the LangGraph engine's -lg suffix",
+            lg.langsmith_project == "proj-lg",
+            lg.langsmith_project,
+        )
+
+        try:
+            load_with(COPILOT_OBSERVABILITY="both", DEEPSEEK_API_KEY="x")
+            check("both mode requires both platforms' keys", False)
+        except ConfigError as exc:
+            check(
+                "both mode requires both platforms' keys",
+                "LANGSMITH_API_KEY" in str(exc) and "ARIZE_API_KEY" in str(exc),
+                str(exc),
+            )
+
+        # Default: exactly today's behaviour, no LangSmith anywhere.
+        default = load_with(
+            DEEPSEEK_API_KEY="x", ARIZE_API_KEY="x", ARIZE_SPACE_ID="x", ARIZE_SPACE_NAME="x",
+        )
+        check(
+            "the default is arize-only (unchanged behaviour)",
+            default.observability == "arize" and default.arize_enabled and not default.langsmith_enabled,
+        )
+
+        eu = load_with(
+            COPILOT_OBSERVABILITY="langsmith", DEEPSEEK_API_KEY="x", LANGSMITH_API_KEY="x",
+            LANGSMITH_ENDPOINT="https://eu.api.smith.langchain.com",
+        )
+        check(
+            "LANGSMITH_ENDPOINT (EU) derives the EU OTLP ingestion URL",
+            eu.langsmith_otlp_endpoint == "https://eu.api.smith.langchain.com/otel/v1/traces",
+            eu.langsmith_otlp_endpoint,
+        )
+    finally:
+        for key, value in saved.items():
+            os.environ.pop(key, None)
+            if value is not None:
+                os.environ[key] = value
+
+    # The exporter lane itself: right URL, key and project travel as headers.
+    dummy = Settings(
+        arize_api_key="", arize_space_id="", arize_space_name="",
+        arize_project_name="proj", arize_region=None, arize_otlp_endpoint="x",
+        deepseek_api_key="x", deepseek_base_url="x",
+        arize_ai_integration_id=None, prompt_version="v1", impl="sdk",
+        observability="langsmith", langsmith_api_key="ls-key", langsmith_project="proj",
+    )
+    processor = _langsmith_processor(dummy, "proj")
+    exporter = processor.span_exporter
+    headers = dict(getattr(exporter, "_headers", None) or {})
+    check(
+        "the LangSmith span processor targets the OTLP ingestion endpoint",
+        getattr(exporter, "_endpoint", "").endswith("/otel/v1/traces"),
+        str(getattr(exporter, "_endpoint", None)),
+    )
+    check(
+        "...authenticating by x-api-key, project by header",
+        headers.get("x-api-key") == "ls-key" and headers.get("Langsmith-Project") == "proj",
+        str(headers),
+    )
+
+    # The trap in `both` mode: Arize's TracerProvider treats its own exporter
+    # as a "default" processor and add_span_processor() *removes* it -- which
+    # would silently turn `both` into langsmith-only. The LangSmith lane must
+    # therefore ride in through register(span_processors=[...]). Assert both
+    # the SDK contract and that tracing.py actually uses it.
+    from pathlib import Path
+
+    from arize.otel import register
+
+    provider = register(
+        space_id="x", api_key="x", project_name="proj",
+        set_global_tracer_provider=False, verbose=False,
+        span_processors=[_langsmith_processor(dummy, "proj")],
+    )
+    lanes = provider._active_span_processor._span_processors
+    check(
+        "register(span_processors=...) keeps both exporter lanes",
+        len(lanes) == 2,
+        f"{len(lanes)} lane(s): {[type(p).__name__ for p in lanes]}",
+    )
+    clobbered = provider._default_processor
+    provider.shutdown()
+    check("...and neither is a clobber-on-add default", not clobbered)
+    tracing_source = (Path(__file__).parent.parent / "src" / "copilot" / "tracing.py").read_text()
+    check(
+        "init_tracing hands the LangSmith lane to register(span_processors=)",
+        "span_processors=" in tracing_source,
+    )
+
+    # Arize-platform steps step aside rather than crash when Arize is off.
+    # (capture() swallows the guard's own "Skipped:" banner.)
+    try:
+        with console.capture():
+            require_arize(dummy, "selfcheck")
+        skipped = None
+    except SystemExit as exc:
+        skipped = exc.code
+    check("require_arize skips (exit 0) when Arize is disabled", skipped == 0, f"exit={skipped}")
+    arize_only = Settings(
+        arize_api_key="x", arize_space_id="x", arize_space_name="x",
+        arize_project_name="proj", arize_region=None, arize_otlp_endpoint="x",
+        deepseek_api_key="x", deepseek_base_url="x",
+        arize_ai_integration_id=None, prompt_version="v1",
+    )
+    try:
+        require_arize(arize_only, "selfcheck")
+        check("require_arize lets the default mode straight through", True)
+    except SystemExit:
+        check("require_arize lets the default mode straight through", False)
+
+
 def check_langgraph_engine() -> None:
     """The second engine: same logic through LangGraph/LangChain.
 
@@ -1147,6 +1360,354 @@ def check_langgraph_engine() -> None:
     )
 
 
+def check_langsmith_tour() -> None:
+    """The ls-steps: same tour, LangSmith platform APIs.
+
+    All offline. The two contracts that matter most: the trajectory rebuild
+    (LangSmith drops custom span attributes, so tools/docs come from child
+    runs), and that every SDK method the port calls actually exists -- the
+    port leans on a couple of surfaces (update_run, _create_commit_tags) that
+    were verified against 0.10.15 and should fail loudly here if an upgrade
+    removes them.
+    """
+    console.print("\n[bold]LangSmith tour (poc/ls*.py)[/bold]")
+    from datetime import datetime, timezone
+    from importlib import import_module
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    # Every ls-step imports cleanly (they import their Arize originals too,
+    # so this also catches a refactor of 03-10 breaking the reuse).
+    modules = {}
+    for stem in (
+        "_ls_common", "ls02b_log_runs", "ls03_query_runs", "ls04_offline_evals",
+        "ls04b_thread_evals", "ls05_online_rules", "ls06_annotations",
+        "ls06b_align_judge", "ls07_dataset", "ls08_experiments",
+        "ls09_prompt_hub", "ls10_dashboards",
+    ):
+        try:
+            modules[stem] = import_module(stem)
+        except Exception as exc:  # noqa: BLE001
+            check(f"{stem} imports", False, f"{type(exc).__name__}: {exc}")
+    check("all ls-steps import cleanly", len(modules) == 12, f"{len(modules)}/12")
+
+    # The SDK surface the port calls, including the two load-bearing
+    # not-quite-public ones (see ls09's tagging comment).
+    from langsmith import Client
+
+    needed = (
+        "list_runs", "update_run", "create_feedback", "batch_ingest_runs",
+        "create_annotation_queue", "add_runs_to_annotation_queue",
+        "list_annotation_queues", "list_runs_from_annotation_queue",
+        "create_dataset", "has_dataset", "create_examples", "list_examples",
+        "read_example", "update_example", "evaluate", "push_prompt",
+        "pull_prompt", "list_prompt_commits", "_create_commit_tags",
+        "read_project", "request_with_retries",
+    )
+    missing = [m for m in needed if not hasattr(Client, m)]
+    check(
+        f"langsmith.Client has all {len(needed)} methods the port calls",
+        not missing,
+        f"missing: {missing}",
+    )
+
+    # The trajectory rebuild: tools and docs from child runs, search_docs
+    # inferred from the kb.search retriever, doc ids deduplicated.
+    lsc = modules["_ls_common"]
+    now = datetime.now(timezone.utc)
+
+    def fake_run(name, run_type, offset=0, outputs=None, parent=None, meta=None):
+        return SimpleNamespace(
+            id=f"id-{name}-{offset}", trace_id="t1", name=name, run_type=run_type,
+            start_time=now.replace(microsecond=offset), inputs={"input": "q?"},
+            outputs=outputs or {"text": "a."}, parent_run_id=parent,
+            extra={"metadata": meta or {}}, error=None, total_tokens=7,
+        )
+
+    root = fake_run(
+        "copilot.turn", "chain",
+        meta={"session_id": "sess-1", "prompt_version": "v1", "turn_index": 0},
+    )
+    children = [
+        fake_run("ChatCompletion", "llm", 1, parent="p"),
+        fake_run("kb.search", "retriever", 2, outputs={"doc_ids": ["d1", "d2"]}, parent="p"),
+        fake_run("kb.search", "retriever", 3, outputs={"doc_ids": ["d2", "d3"]}, parent="p"),
+        fake_run("lookup_order", "tool", 4, parent="p"),
+    ]
+    frame = lsc.turn_runs_to_df([root], {"t1": children})
+    row = frame.iloc[0]
+    check(
+        "turn_runs_to_df rebuilds the trajectory from child runs",
+        row["tool_calls"] == "search_docs,lookup_order",
+        row["tool_calls"],
+    )
+    check(
+        "...deduplicating retrieved doc ids in order",
+        row["retrieved_doc_ids"] == "d1,d2,d3",
+        row["retrieved_doc_ids"],
+    )
+    check(
+        "...and carrying thread metadata (session_id) through",
+        row["session_id"] == "sess-1" and row["prompt_version"] == "v1",
+    )
+
+    # Guard symmetry: ls-steps step aside under arize-only, pass otherwise.
+    from copilot.config import Settings
+
+    arize_only = Settings(
+        arize_api_key="x", arize_space_id="x", arize_space_name="x",
+        arize_project_name="proj", arize_region=None, arize_otlp_endpoint="x",
+        deepseek_api_key="x", deepseek_base_url="x",
+        arize_ai_integration_id=None, prompt_version="v1",
+    )
+    try:
+        with console.capture():
+            lsc.require_langsmith(arize_only, "selfcheck")
+        skipped = None
+    except SystemExit as exc:
+        skipped = exc.code
+    check("require_langsmith skips (exit 0) when LangSmith is disabled", skipped == 0)
+    both = Settings(
+        arize_api_key="x", arize_space_id="x", arize_space_name="x",
+        arize_project_name="proj", arize_region=None, arize_otlp_endpoint="x",
+        deepseek_api_key="x", deepseek_base_url="x",
+        arize_ai_integration_id=None, prompt_version="v1",
+        observability="both", langsmith_api_key="x", langsmith_project="proj",
+    )
+    try:
+        lsc.require_langsmith(both, "selfcheck")
+        check("...and lets `both` mode straight through", True)
+    except SystemExit:
+        check("...and lets `both` mode straight through", False)
+    check(
+        "the API host maps to the matching app URL (EU included)",
+        lsc.app_url(both) == "https://smith.langchain.com"
+        and lsc.app_url(
+            Settings(
+                arize_api_key="x", arize_space_id="x", arize_space_name="x",
+                arize_project_name="p", arize_region=None, arize_otlp_endpoint="x",
+                deepseek_api_key="x", deepseek_base_url="x",
+                arize_ai_integration_id=None, prompt_version="v1",
+                observability="langsmith", langsmith_api_key="x",
+                langsmith_base_url="https://eu.api.smith.langchain.com",
+            )
+        )
+        == "https://eu.smith.langchain.com",
+    )
+
+    # Prompt Hub plumbing: system text extraction from a real ChatPromptTemplate,
+    # and the loader's fallback-vs-strict behaviour without any network.
+    import langsmith as ls_pkg
+
+    from copilot import prompts as prompts_mod
+
+    template = modules["ls09_prompt_hub"].make_template("hello world")
+    check(
+        "ls_system_text reads a real ChatPromptTemplate",
+        prompts_mod.ls_system_text(template) == "hello world",
+        prompts_mod.ls_system_text(template),
+    )
+    try:
+        prompts_mod.load_prompt("bogus")
+        check("unknown prompt versions still raise", False)
+    except ValueError as exc:
+        check("unknown prompt versions still raise (and name ls-hub)", "ls-hub" in str(exc))
+
+    class _Boom:
+        def __init__(self, *a, **k):
+            raise RuntimeError("no network in selfcheck")
+
+    real_client = ls_pkg.Client
+    try:
+        ls_pkg.Client = _Boom
+        with console.capture():
+            fallback = prompts_mod.load_prompt("ls-hub", settings=both)
+        check("ls-hub falls back to local V2 when the fetch fails", fallback == prompts_mod.V2)
+        try:
+            prompts_mod.load_prompt("ls-hub", settings=both, strict=True)
+            check("...but strict=True raises instead", False)
+        except RuntimeError:
+            check("...but strict=True raises instead", True)
+    finally:
+        ls_pkg.Client = real_client
+
+    # ls08's adapters: an 08 evaluator wrapped for LangSmith, and the results
+    # frame renamed into the shape 08's compare machinery expects.
+    ls08 = modules["ls08_experiments"]
+    exp = import_module("08_experiments")
+    wrapped = ls08.wrap_evaluator(exp.conciseness, "conciseness")
+    verdict = wrapped(
+        SimpleNamespace(outputs={"answer": "short and sweet"}),
+        SimpleNamespace(inputs={"question": "q"}, outputs={"expected_behavior": ""}),
+    )
+    check(
+        "wrap_evaluator turns an 08 evaluator into LangSmith feedback",
+        verdict["key"] == "conciseness" and verdict["score"] == 1.0,
+        str(verdict),
+    )
+    fake_results = SimpleNamespace(
+        to_pandas=lambda: pd.DataFrame(
+            {"example_id": ["e1"], "feedback.groundedness": [1.0], "outputs.answer": ["a"]}
+        )
+    )
+    renamed = ls08.to_frame(fake_results)
+    check(
+        "to_frame renames feedback columns into 08's .score shape",
+        "eval.groundedness.score" in renamed.columns and "example_id" in renamed.columns,
+        str(list(renamed.columns)),
+    )
+
+    # Project-scoped names everywhere a workspace-level artefact gets created.
+    check(
+        "rule, section and queue names are all project-scoped",
+        modules["ls05_online_rules"].rule_name("R", "proj").endswith("(proj)")
+        and modules["ls10_dashboards"].section_name("proj").endswith("(proj)"),
+    )
+
+    # The online judge's model must be a serialized Runnable (an empty dict is
+    # a 400), key by secret *reference*, and think-off (structured output
+    # forces tool_choice, which DeepSeek rejects mid-thinking).
+    spec = modules["ls05_online_rules"].judge_model_spec()
+    check(
+        "ls05 judge model spec: Runnable constructor, secret ref, thinking off",
+        spec.get("type") == "constructor"
+        and spec["kwargs"]["api_key"].get("type") == "secret"
+        and spec["kwargs"]["extra_body"] == {"thinking": {"type": "disabled"}},
+        str(spec)[:120],
+    )
+
+    # ls03 must not count double-traced experiment turns as production
+    # traffic: anonymous turns (no caller-supplied user) are excluded, using
+    # step 03's predicate rather than a second copy of it.
+    ls_common = modules["_ls_common"]
+    from types import SimpleNamespace as NS
+
+    anon_run = NS(
+        id="r1", trace_id="t1", start_time=1, error=None,
+        inputs={"input": "q"}, outputs={"text": "a"},
+        extra={"metadata": {"session_id": "sess-deadbeef", "user_id": "anonymous"}},
+    )
+    frame = ls_common.turn_runs_to_df([anon_run], {})
+    check(
+        "turn_runs_to_df exposes user_id so ls03 can drop anonymous turns",
+        list(frame["user_id"]) == ["anonymous"],
+        str(list(frame.columns)),
+    )
+    ls03_source = Path(__file__).with_name("ls03_query_runs.py").read_text()
+    check(
+        "ls03 filters with step 03's production_turns, not its own copy",
+        "observe.production_turns(" in ls03_source,
+    )
+
+    # Both datasets accumulate a batch per run, so an experiment over the whole
+    # thing blends traffic samples. ls08 scopes by filtering examples; step 08
+    # cannot (Arize's runner takes a dataset name), so 07 publishes a dataset
+    # per batch instead. Check each does its own half.
+    ls08 = modules["ls08_experiments"]
+
+    def example(batch_value, created="2026-07-31 22:00:00+00:00"):
+        return NS(
+            metadata={"batch": batch_value} if batch_value else {},
+            created_at=created,
+        )
+
+    picked, scope = ls08.select_batch(
+        NS(list_examples=lambda dataset_name: [
+            example("20260731-2220"), example("20260802-0945"), example("20260802-0945"),
+        ]),
+        "copilot-failures-ls",
+        "latest",
+    )
+    check(
+        "ls08 --batch latest measures only the newest traffic sample",
+        len(picked) == 2 and "20260802-0945" in scope,
+        f"{len(picked)} examples, scope={scope!r}",
+    )
+    whole, all_scope = ls08.select_batch(NS(), "copilot-failures-ls", "all")
+    check(
+        "ls08 --batch all keeps the blended view",
+        whole == "copilot-failures-ls" and "every batch" in all_scope,
+    )
+    # A dataset built before batches existed is still scopeable, by the day its
+    # examples were created -- otherwise "latest" would silently mean "all" on
+    # exactly the datasets this option was added for.
+    legacy, legacy_scope = ls08.select_batch(
+        NS(list_examples=lambda dataset_name: [
+            example(None, "2026-08-01 10:00:00+00:00"),
+            example(None, "2026-08-02 09:00:00+00:00"),
+            example(None, "2026-08-02 09:05:00+00:00"),
+        ]),
+        "copilot-failures-ls",
+        "latest",
+    )
+    check(
+        "a pre-batch dataset scopes by creation date rather than measuring all",
+        len(legacy) == 2 and "2026-08-02" in legacy_scope,
+        f"{len(legacy) if not isinstance(legacy, str) else legacy} / {legacy_scope!r}",
+    )
+    check(
+        "step 07 publishes a run-scoped dataset, since Arize cannot filter rows",
+        'f"{name}-{batch}"' in Path(__file__).with_name("07_dataset.py").read_text(),
+    )
+    check(
+        "step 08 resolves --dataset latest to that run dataset",
+        "def resolve_dataset(" in Path(__file__).with_name("08_experiments.py").read_text(),
+    )
+
+    # Re-running an evaluation step must correct its earlier verdict, not add a
+    # second one: create_feedback mints a new record per call, so a run would
+    # count several times in every feedback average. A deterministic id makes
+    # the write an upsert (confirmed against the API).
+    same = ls_common.feedback_id("run-1", "groundedness")
+    check(
+        "a run+key owns exactly one feedback id, stable across runs",
+        same == ls_common.feedback_id("run-1", "groundedness")
+        and same != ls_common.feedback_id("run-1", "conciseness")
+        and same != ls_common.feedback_id("run-2", "groundedness"),
+    )
+    written = {}
+
+    class _FakeClient:
+        def create_feedback(self, **kw):
+            written.update(kw)
+
+    ls_common.upsert_feedback(
+        _FakeClient(), run_id="run-1", key="groundedness", project_id="p", score=1.0
+    )
+    check(
+        "every feedback write carries that id, so a re-run replaces its verdict",
+        written.get("feedback_id") == same and written.get("session_id") == "p",
+        str({k: str(v)[:20] for k, v in written.items()}),
+    )
+    for step in ("ls02b_log_runs", "ls04_offline_evals", "ls04b_thread_evals",
+                 "ls06_annotations"):
+        source = Path(__file__).with_name(f"{step}.py").read_text()
+        check(
+            f"{step} writes feedback through the upsert helper",
+            "upsert_feedback(" in source and "client.create_feedback(" not in source,
+        )
+
+    # update_run replaces the tag list, so ls03 must merge rather than write
+    # only its own verdict -- otherwise a tag applied in the UI or by a rule
+    # disappears the first time the observe step runs.
+    merged = modules["ls03_query_runs"].merged_tags(
+        ["pii-redacted", "demo", "failure:verbosity"], ["hallucination"]
+    )
+    check(
+        "ls03 keeps a run's other tags and replaces only its own verdict",
+        merged == ["pii-redacted", "demo", "failure:hallucination"],
+        str(merged),
+    )
+    check(
+        "a clean turn is tagged failure:none, not left bare",
+        modules["ls03_query_runs"].merged_tags(["demo"], []) == ["demo", "failure:none"],
+    )
+    check(
+        "ls03 reads each run's existing tags before writing",
+        "tags_by_run" in ls03_source and "merged_tags(" in ls03_source,
+    )
+
+
 def check_sdk_surface() -> None:
     console.print("\n[bold]SDK surface[/bold]")
     try:
@@ -1213,7 +1774,9 @@ def main() -> None:
     check_dataframe_contracts()
     check_targets_ax_not_phoenix()
     check_region_wiring()
+    check_observability()
     check_langgraph_engine()
+    check_langsmith_tour()
     check_sdk_surface()
 
     console.print()

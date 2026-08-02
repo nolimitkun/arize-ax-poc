@@ -19,7 +19,7 @@ from __future__ import annotations
 import pandas as pd
 import typer
 
-from _common import arize_client, console, done, header, load, look_at, save, table
+from _common import arize_client, console, done, header, load, look_at, require_arize, save, table
 
 app = typer.Typer(add_completion=False)
 
@@ -166,6 +166,7 @@ def main(
         "Evaluate: LLM-as-judge + code evaluators, logged back to spans",
         "run-evals-on-traces · get-started-evaluations",
     )
+    require_arize(settings, "logging evals onto spans")
 
     turns = load("03_turns.parquet")
     if limit:

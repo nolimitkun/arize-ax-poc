@@ -21,7 +21,7 @@ import os
 
 import typer
 
-from _common import arize_client, console, done, header, look_at, table, window
+from _common import arize_client, console, done, header, look_at, require_arize, table, window
 
 app = typer.Typer(add_completion=False)
 
@@ -204,6 +204,7 @@ def main(
         "Observe: monitors, alerting and dashboards",
         "production-monitoring · dashboards · monitors GraphQL API",
     )
+    require_arize(settings, "monitors and dashboards")
 
     # ---- 1. Confirm there is something to monitor ------------------------
     client = arize_client(settings)

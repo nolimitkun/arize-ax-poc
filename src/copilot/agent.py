@@ -176,6 +176,11 @@ def run_turn(
         "prompt_version": version,
         "agent_model": answer_model,
         "turn_index": len(history or []) // 2,
+        # Arize groups sessions on the session.id attribute set below; LangSmith
+        # Threads group on *metadata* session_id, which OTel ingest doesn't
+        # derive from the attribute -- so it rides in both places.
+        "session_id": session_id,
+        "user_id": user_id or "anonymous",
         **(extra_metadata or {}),
     }
 
