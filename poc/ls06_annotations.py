@@ -23,7 +23,7 @@ from importlib import import_module
 import typer
 
 from _common import console, done, header, load, save, table
-from _ls_common import look_at_ls, ls_client, ls_project_id, require_langsmith
+from _ls_common import look_at_ls, ls_client, ls_project_id, require_langsmith, upsert_feedback
 
 anno = import_module("06_annotations")
 
@@ -36,6 +36,11 @@ def main(
     skip_queue: bool = typer.Option(False, help="Skip queue creation, just write labels"),
     label_all: bool = typer.Option(
         True, help="Simulate labels for every turn, not just the queued ones"
+    ),
+    prune_duplicates: bool = typer.Option(
+        False,
+        help="Also delete labels left by runs that predate deterministic "
+        "feedback ids (one extra API call per run)",
     ),
 ) -> None:
     settings = header(
@@ -126,13 +131,15 @@ def main(
         }
     )
     for _, row in annotations.iterrows():
-        client.create_feedback(
+        upsert_feedback(
+            client,
             run_id=row["context.span_id"],
             key=anno.ANNOTATION_NAME,
+            project_id=pid,
             score=float(row[f"annotation.{anno.ANNOTATION_NAME}.score"]),
             value=str(row[f"annotation.{anno.ANNOTATION_NAME}.label"]),
             comment=str(row[f"annotation.{anno.ANNOTATION_NAME}.text"]),
-            session_id=pid,
+            prune=prune_duplicates,
         )
     console.print(f"[green]Logged {len(annotations)} human labels as feedback.[/green]")
     save("ls06_annotations.parquet", annotations)

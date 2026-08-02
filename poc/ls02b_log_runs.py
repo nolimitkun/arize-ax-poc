@@ -26,7 +26,7 @@ from importlib import import_module
 import typer
 
 from _common import console, done, header, table
-from _ls_common import look_at_ls, ls_client, ls_project_id, require_langsmith
+from _ls_common import look_at_ls, ls_client, ls_project_id, require_langsmith, upsert_feedback
 
 backfill = import_module("02b_log_spans")
 
@@ -155,13 +155,14 @@ def main(
 
     console.print("Attaching the legacy verdicts as feedback…")
     for run_id, label, score in feedback:
-        client.create_feedback(
+        upsert_feedback(
+            client,
             run_id=run_id,
             key="groundedness",
+            project_id=pid,
             score=float(score),
             value=label,
             comment="Backfilled verdict from the legacy quality review.",
-            session_id=pid,
         )
     console.print(f"[green]{len(feedback)} verdicts attached.[/green]")
 

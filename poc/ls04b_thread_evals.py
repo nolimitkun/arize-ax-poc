@@ -26,7 +26,7 @@ from importlib import import_module
 import typer
 
 from _common import console, done, header, load, save, table
-from _ls_common import look_at_ls, ls_client, ls_project_id, require_langsmith
+from _ls_common import look_at_ls, ls_client, ls_project_id, require_langsmith, upsert_feedback
 
 sess = import_module("04b_session_evals")
 
@@ -126,13 +126,14 @@ def main(
         pid = ls_project_id(client, settings.langsmith_project)
         console.print("\nWriting thread verdicts onto the closing run of each thread…")
         for _, row in graded.iterrows():
-            client.create_feedback(
+            upsert_feedback(
+                client,
                 run_id=row["span_id"],
                 key=sess.SESSION_EVAL,
+                project_id=pid,
                 score=float(row["score"]),
                 value=str(row["label"]),
                 comment=str(row["explanation"]),
-                session_id=pid,
             )
         console.print(f"[green]Logged {len(graded)} thread verdicts.[/green]")
 

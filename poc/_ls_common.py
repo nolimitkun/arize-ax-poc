@@ -8,6 +8,7 @@ originals; what lives here is only the platform plumbing that replaces
 
 from __future__ import annotations
 
+import uuid
 from typing import Any, Iterable
 
 from _common import Settings, console
@@ -49,6 +50,62 @@ def ls_project_id(client, name: str) -> str:
     and the queue's RunKey inputs require it outright.
     """
     return str(client.read_project(project_name=name).id)
+
+
+# Namespace for deterministic feedback ids. Any fixed UUID works; this one is
+# constant so the id for a given (run, key) is stable across machines and runs.
+_FEEDBACK_NAMESPACE = uuid.UUID("6f2d7a1e-5c3b-4f8a-9d0e-1b2c3d4e5f60")
+
+
+def feedback_id(run_id: str, key: str) -> uuid.UUID:
+    """The one feedback record a given evaluator owns on a given run."""
+    return uuid.uuid5(_FEEDBACK_NAMESPACE, f"{run_id}|{key}")
+
+
+def upsert_feedback(
+    client,
+    *,
+    run_id: str,
+    key: str,
+    project_id: str,
+    score: float | None = None,
+    value: Any = None,
+    comment: str = "",
+    prune: bool = False,
+) -> None:
+    """Write one verdict per (run, evaluator), replacing any earlier one.
+
+    `create_feedback` mints a new record every call, so re-running a step --
+    after a judge changed its mind, or with a different --limit -- leaves a run
+    carrying several verdicts for the same key. Nothing errors; the run just
+    quietly counts more than once in every feedback average, and a re-run makes
+    the metric drift without the traffic changing.
+
+    Passing a deterministic `feedback_id` makes the write an upsert instead
+    (verified against the API: two writes with one id leave one record, the
+    second value winning), so a step is safe to re-run and the second run
+    corrects the first rather than stacking on it.
+
+    `prune` additionally clears strays written *before* this became an upsert.
+    It costs a list call per run, so it is opt-in rather than the default.
+    """
+    if prune:
+        try:
+            keep = feedback_id(run_id, key)
+            for existing in client.list_feedback(run_ids=[run_id], feedback_key=[key]):
+                if existing.id != keep:
+                    client.delete_feedback(existing.id)
+        except Exception:  # noqa: BLE001 - pruning is housekeeping, not the job
+            pass
+    client.create_feedback(
+        run_id=run_id,
+        key=key,
+        score=score,
+        value=value,
+        comment=comment,
+        session_id=project_id,
+        feedback_id=feedback_id(run_id, key),
+    )
 
 
 def app_url(settings: Settings) -> str:

@@ -1654,6 +1654,59 @@ def check_langsmith_tour() -> None:
         "def resolve_dataset(" in Path(__file__).with_name("08_experiments.py").read_text(),
     )
 
+    # Re-running an evaluation step must correct its earlier verdict, not add a
+    # second one: create_feedback mints a new record per call, so a run would
+    # count several times in every feedback average. A deterministic id makes
+    # the write an upsert (confirmed against the API).
+    same = ls_common.feedback_id("run-1", "groundedness")
+    check(
+        "a run+key owns exactly one feedback id, stable across runs",
+        same == ls_common.feedback_id("run-1", "groundedness")
+        and same != ls_common.feedback_id("run-1", "conciseness")
+        and same != ls_common.feedback_id("run-2", "groundedness"),
+    )
+    written = {}
+
+    class _FakeClient:
+        def create_feedback(self, **kw):
+            written.update(kw)
+
+    ls_common.upsert_feedback(
+        _FakeClient(), run_id="run-1", key="groundedness", project_id="p", score=1.0
+    )
+    check(
+        "every feedback write carries that id, so a re-run replaces its verdict",
+        written.get("feedback_id") == same and written.get("session_id") == "p",
+        str({k: str(v)[:20] for k, v in written.items()}),
+    )
+    for step in ("ls02b_log_runs", "ls04_offline_evals", "ls04b_thread_evals",
+                 "ls06_annotations"):
+        source = Path(__file__).with_name(f"{step}.py").read_text()
+        check(
+            f"{step} writes feedback through the upsert helper",
+            "upsert_feedback(" in source and "client.create_feedback(" not in source,
+        )
+
+    # update_run replaces the tag list, so ls03 must merge rather than write
+    # only its own verdict -- otherwise a tag applied in the UI or by a rule
+    # disappears the first time the observe step runs.
+    merged = modules["ls03_query_runs"].merged_tags(
+        ["pii-redacted", "demo", "failure:verbosity"], ["hallucination"]
+    )
+    check(
+        "ls03 keeps a run's other tags and replaces only its own verdict",
+        merged == ["pii-redacted", "demo", "failure:hallucination"],
+        str(merged),
+    )
+    check(
+        "a clean turn is tagged failure:none, not left bare",
+        modules["ls03_query_runs"].merged_tags(["demo"], []) == ["demo", "failure:none"],
+    )
+    check(
+        "ls03 reads each run's existing tags before writing",
+        "tags_by_run" in ls03_source and "merged_tags(" in ls03_source,
+    )
+
 
 def check_sdk_surface() -> None:
     console.print("\n[bold]SDK surface[/bold]")

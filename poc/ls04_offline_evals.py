@@ -18,7 +18,7 @@ import pandas as pd
 import typer
 
 from _common import console, done, header, load, save, table
-from _ls_common import look_at_ls, ls_client, ls_project_id, require_langsmith
+from _ls_common import look_at_ls, ls_client, ls_project_id, require_langsmith, upsert_feedback
 
 # One definition of every evaluator, owned by step 04.
 offline = import_module("04_offline_evals")
@@ -31,6 +31,11 @@ def main(
     judge_model: str = typer.Option("deepseek-v4-pro", help="Model backing the LLM judge"),
     skip_llm: bool = typer.Option(False, help="Run only the code evaluators"),
     limit: int = typer.Option(0, help="Evaluate only the first N turns"),
+    prune_duplicates: bool = typer.Option(
+        False,
+        help="Also delete verdicts left by runs that predate deterministic "
+        "feedback ids (one extra API call per run)",
+    ),
 ) -> None:
     settings = header(
         "ls04",
@@ -118,13 +123,15 @@ def main(
                 score = row.get(f"eval.{name}.score")
                 if pd.isna(score):
                     continue
-                client.create_feedback(
+                upsert_feedback(
+                    client,
                     run_id=row["context.span_id"],
                     key=name,
+                    project_id=pid,
                     score=float(score),
                     value=str(row.get(f"eval.{name}.label", "")),
                     comment=str(row.get(f"eval.{name}.explanation", "")),
-                    session_id=pid,
+                    prune=prune_duplicates,
                 )
                 written += 1
         console.print(f"[green]Logged {written} feedback entries[/green] ({what}).")

@@ -32,6 +32,25 @@ observe = import_module("03_query_spans")
 app = typer.Typer(add_completion=False)
 
 
+def merged_tags(existing: list[str], modes: list[str]) -> list[str]:
+    """This step's verdict, added to whatever the run already carried.
+
+    `update_run` replaces the tag list wholesale, so writing only the failure
+    tags would drop everything else the run arrived with -- a reviewer's tag
+    from the UI, one an automation rule applied, or tags supplied at ingest.
+    A previous `failure:*` from this same step *is* dropped: this run
+    supersedes it, and keeping both would leave a run tagged with two
+    contradictory verdicts.
+
+    "failure:none" rather than no tag at all -- an untagged run is
+    indistinguishable from an unexamined one, and "no failures" is a finding
+    (the same reasoning as step 03's "none").
+    """
+    found = [f"failure:{m}" for m in modes] or ["failure:none"]
+    kept = [t for t in existing if not str(t).startswith("failure:")]
+    return kept + found
+
+
 @app.command()
 def main(
     hours: int = typer.Option(24, help="How far back to query"),
@@ -76,6 +95,7 @@ def main(
         if r.parent_run_id is not None:
             children.setdefault(str(r.trace_id), []).append(r)
 
+    tags_by_run = {str(r.id): list(r.tags or []) for r in roots}
     turns = turn_runs_to_df(roots, children)
     turns = turns.sort_values("start_time", kind="stable").reset_index(drop=True)
 
@@ -159,10 +179,7 @@ def main(
         tagged, already, errors = 0, 0, []
         for _, r in turns.iterrows():
             modes = [m for m in r["failures"].split(",") if m]
-            # "failure:none" rather than no tag -- an untagged run is
-            # indistinguishable from an unexamined one, and "no failures"
-            # is a finding (the same reasoning as step 03's "none").
-            tags = [f"failure:{m}" for m in modes] or ["failure:none"]
+            tags = merged_tags(tags_by_run.get(str(r["span_id"]), []), modes)
             try:
                 client.update_run(r["span_id"], tags=tags)
                 tagged += 1
