@@ -75,6 +75,66 @@ def evaluate(tool_calls, output):
 INTEGRATION_NAME = "deepseek-poc"
 
 
+def groundedness_config(integration_id: str, model_name: str):
+    """The hosted judge, in the shape `create_template_evaluator` takes.
+
+    The request types (`TemplateConfigInput`, `EvaluatorLlmConfigRequest`) are
+    not the response types `evaluators.get` returns (`TemplateConfig`, ...).
+    Since SDK 8.57 the create calls reject the response type outright -- and
+    the response type silently ignores a field name it doesn't know, so the
+    wrong type is worse than a crash when it *doesn't* crash.
+    """
+    from arize.evaluators.types import (
+        EvaluatorLlmConfigRequest,
+        OptimizationDirection,
+        TemplateConfigInput,
+    )
+
+    return TemplateConfigInput(
+        name="Groundedness",
+        template=GROUNDEDNESS_TEMPLATE,
+        classification_choices={"grounded": 1, "hallucinated": 0},
+        direction=OptimizationDirection.MAXIMIZE,
+        include_explanations=True,
+        # Both of AX's structured-output mechanisms are unusable against
+        # DeepSeek V4, for the same reasons poc/04 hits locally:
+        # `response_format: json_schema` is unsupported, and a forced
+        # tool_choice is rejected while thinking mode is on (it is on by
+        # default, and there is no reliable seam to disable it from here --
+        # InvocationParams has no `thinking` field). Turning both off makes the
+        # judge emit a plain-text label, which works either way.
+        use_function_calling=False,
+        use_structured_output=False,
+        llm_config=EvaluatorLlmConfigRequest(
+            ai_integration_id=integration_id,
+            model_name=model_name,
+            invocation_parameters={},
+            provider_parameters={},
+        ),
+    )
+
+
+def escalation_config():
+    """The code evaluator, already wrapped in the oneOf the API sends.
+
+    Pre-wrapped on purpose. Handed a bare `CustomCodeConfigRequest`, SDK 8.57's
+    `_coerce_code_config` stores it in the wrapper's validator slot rather than
+    as `actual_instance`, so `code_config` serializes as null and the server
+    answers 422 "version: Invalid input". A ready `CodeConfigRequest` is passed
+    through as-is -- and constructing it positionally sets `actual_instance`.
+    """
+    from arize.evaluators.types import CodeConfigRequest, CustomCodeConfigRequest
+
+    return CodeConfigRequest(
+        CustomCodeConfigRequest(
+            type="CUSTOM",
+            name="EscalationAppropriate",
+            code=ESCALATION_CODE,
+            variables=["tool_calls", "output"],
+        )
+    )
+
+
 def evaluator_id(obj) -> str:
     return str(getattr(obj, "id", None) or getattr(getattr(obj, "evaluator", None), "id", ""))
 
@@ -241,12 +301,6 @@ def main(
     )
     require_arize(settings, "evaluators and online tasks")
 
-    from arize.evaluators.types import (
-        CustomCodeConfig,
-        EvaluatorLlmConfig,
-        OptimizationDirection,
-        TemplateConfig,
-    )
     from arize.tasks.types import TaskEvaluatorInput, TaskType
 
     client = arize_client(settings)
@@ -274,29 +328,7 @@ def main(
             )
         else:
             console.print(f"Using AI integration [bold]{integration_id}[/bold]")
-            groundedness_config = TemplateConfig(
-                name="Groundedness",
-                template=GROUNDEDNESS_TEMPLATE,
-                classification_choices={"grounded": 1, "hallucinated": 0},
-                direction=OptimizationDirection.MAXIMIZE,
-                include_explanations=True,
-                # Both of AX's structured-output mechanisms are unusable
-                # against DeepSeek V4, for the same reasons poc/04 hits
-                # locally: `response_format: json_schema` is unsupported, and a
-                # forced tool_choice is rejected while thinking mode is on (it
-                # is on by default, and there is no reliable seam to disable it
-                # from here -- InvocationParams has no `thinking` field).
-                # Turning both off makes the judge emit a plain-text label,
-                # which works either way.
-                use_function_calling_if_available=False,
-                use_structured_output=False,
-                llm_config=EvaluatorLlmConfig(
-                    ai_integration_id=integration_id,
-                    model_name=model_name,
-                    invocation_parameters={},
-                    provider_parameters={},
-                ),
-            )
+            judge_config = groundedness_config(integration_id, model_name)
             eval_id, how = upsert_evaluator(
                 client,
                 space,
@@ -306,14 +338,14 @@ def main(
                     space=space,
                     commit_message="Flag support answers that invent undocumented policy",
                     description="Catches confident answers on topics the KB doesn't cover.",
-                    template_config=groundedness_config,
+                    template_config=judge_config,
                 ),
                 lambda: client.evaluators.create_template_version(
                     evaluator="Groundedness",
                     space=space,
                     commit_message="Text-mode labels: DeepSeek V4 rejects json_schema "
                     "and forced tool_choice under thinking mode",
-                    template_config=groundedness_config,
+                    template_config=judge_config,
                 ),
             )
             created.append(("template", "Groundedness", eval_id))
@@ -367,12 +399,7 @@ def main(
     # so and let the rest of the tour proceed. The same logic already ran
     # locally in poc/04, so nothing is left undemonstrated; only the
     # in-platform continuous version is unavailable.
-    escalation_config = CustomCodeConfig(
-        type="CUSTOM",
-        name="EscalationAppropriate",
-        code=ESCALATION_CODE,
-        variables=["tool_calls", "output"],
-    )
+    code_config = escalation_config()
     try:
         code_id, how = upsert_evaluator(
             client,
@@ -383,13 +410,13 @@ def main(
                 space=space,
                 commit_message="Flag distressed turns that never escalated",
                 description="Deterministic check on the agent's escalation trajectory.",
-                code_config=escalation_config,
+                code_config=code_config,
             ),
             lambda: client.evaluators.create_code_version(
                 evaluator="EscalationAppropriate",
                 space=space,
                 commit_message="Refresh escalation trajectory check",
-                code_config=escalation_config,
+                code_config=code_config,
             ),
         )
     except Exception as exc:  # noqa: BLE001
