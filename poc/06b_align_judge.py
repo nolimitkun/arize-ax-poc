@@ -213,6 +213,43 @@ def supplies_context(template: str) -> bool:
     return any(hint in name.lower() for name in placeholders for hint in CONTEXT_HINTS)
 
 
+def as_version_request(config, template: str):
+    """The hosted config, re-shaped as a new-version request with `template`.
+
+    `evaluators.get` hands back the response type (`TemplateConfig`) and
+    `create_template_version` takes the request type (`TemplateConfigInput`);
+    since SDK 8.57 they are distinct and the create call rejects the response
+    type. Every other setting is carried across field by field, so a judge
+    model or label set someone changed in the UI survives the new version.
+
+    The split goes all the way down -- `invocation_parameters` comes back as
+    `InvocationParams` and must go out as `InvocationParamsRequest` -- so the
+    nested parameter blocks travel as plain dicts, which the request accepts.
+    """
+    from arize.evaluators.types import EvaluatorLlmConfigRequest, TemplateConfigInput
+
+    def plain(params) -> dict:
+        return params.to_dict() if hasattr(params, "to_dict") else dict(params or {})
+
+    llm = config.llm_config
+    return TemplateConfigInput(
+        name=config.name,
+        template=template,
+        classification_choices=config.classification_choices,
+        direction=config.direction,
+        data_granularity=config.data_granularity,
+        include_explanations=bool(config.include_explanations),
+        use_function_calling=bool(config.use_function_calling),
+        use_structured_output=bool(config.use_structured_output),
+        llm_config=EvaluatorLlmConfigRequest(
+            ai_integration_id=llm.ai_integration_id,
+            model_name=llm.model_name,
+            invocation_parameters=plain(llm.invocation_parameters),
+            provider_parameters=plain(llm.provider_parameters),
+        ),
+    )
+
+
 def publish(client, settings, examples: list[dict[str, str]], commit: str) -> None:
     """Add the aligned template as a new version of the AX evaluator.
 
@@ -223,8 +260,6 @@ def publish(client, settings, examples: list[dict[str, str]], commit: str) -> No
     That also means an edit someone made in the UI is carried forward instead of
     being silently overwritten.
     """
-    from arize.evaluators.types import TemplateConfig
-
     from copilot.evals import build_aligned_template
 
     current = client.evaluators.get(evaluator=AX_EVALUATOR_NAME, space=settings.arize_space_name)
@@ -258,17 +293,11 @@ def publish(client, settings, examples: list[dict[str, str]], commit: str) -> No
                 else ""
             )
         ),
-        template_config=TemplateConfig(
-            name=config.name,
+        template_config=as_version_request(
+            config,
             # escape=False: AX substitutes `{input.value}` itself, so doubling
             # the braces would put a literal brace pair in front of the judge.
-            template=build_aligned_template(examples, base=config.template, escape=False),
-            classification_choices=config.classification_choices,
-            direction=config.direction,
-            include_explanations=config.include_explanations,
-            use_function_calling_if_available=config.use_function_calling_if_available,
-            use_structured_output=getattr(config, "use_structured_output", False),
-            llm_config=config.llm_config,
+            build_aligned_template(examples, base=config.template, escape=False),
         ),
     )
 

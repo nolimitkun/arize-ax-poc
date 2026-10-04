@@ -650,6 +650,81 @@ def check_judge_alignment() -> None:
           not module.supplies_context(ax.GROUNDEDNESS_TEMPLATE))
 
 
+def check_evaluator_requests() -> None:
+    """What 05 and 06b send is the type the SDK's create calls declare.
+
+    A type merely *existing* proves nothing: SDK 8.57 kept `TemplateConfig`
+    and stopped accepting it, so every existence check passed while step 05
+    crashed on its first live call.
+    """
+    console.print("\n[bold]Evaluator request shapes (steps 05, 06b)[/bold]")
+    import importlib
+    import inspect
+
+    try:
+        from arize.evaluators.client import EvaluatorsClient
+        from arize.evaluators.types import EvaluatorLlmConfig, TemplateConfig
+    except Exception as exc:  # noqa: BLE001
+        check("arize evaluator types import", False, str(exc))
+        return
+
+    def declared(method: str, param: str) -> str:
+        signature = inspect.signature(getattr(EvaluatorsClient, method))
+        return str(signature.parameters[param].annotation)
+
+    ax = importlib.import_module("05_online_evals")
+    judge = ax.groundedness_config("integration-id", "deepseek-v4-pro")
+    check("05's judge config is the type create_template_evaluator declares",
+          type(judge).__name__ == declared("create_template_evaluator", "template_config"))
+    # DeepSeek V4 rejects both structured-output mechanisms (see 05). The
+    # response type ignores field names it doesn't know, so a rename would
+    # leave these at the SDK default with no error anywhere.
+    check("...with function calling off", judge.use_function_calling is False)
+    check("...and structured output off", judge.use_structured_output is False)
+    code = ax.escalation_config()
+    check("05's code config is one create_code_evaluator accepts",
+          type(code).__name__ in declared("create_code_evaluator", "code_config"))
+    # Accepted is not sent. Run it through the SDK's own coercion and
+    # serialize it the way the request will: SDK 8.57 wraps a bare inner config
+    # so that it serializes as null, and the server's 422 is the only symptom.
+    from arize._generated import api_client as gen
+
+    sent = gen.CreateCodeEvaluatorVersionRequest(
+        commit_message="selfcheck",
+        code_config=EvaluatorsClient._coerce_code_config(code),
+    ).to_dict()
+    check("...and survives the SDK's coercion with its code intact",
+          "def evaluate" in str((sent.get("code_config") or {}).get("code", "")))
+
+    align = importlib.import_module("06b_align_judge")
+    hosted = TemplateConfig(  # the shape evaluators.get hands back
+        name="Groundedness",
+        template="old {input.value}",
+        classification_choices={"grounded": 1, "hallucinated": 0},
+        include_explanations=True,
+        use_function_calling=False,
+        use_structured_output=False,
+        llm_config=EvaluatorLlmConfig(
+            ai_integration_id="integration-id",
+            model_name="deepseek-v4-pro",
+            invocation_parameters={"temperature": 0.0},
+            provider_parameters={},
+        ),
+    )
+    version = align.as_version_request(hosted, "new {input.value}")
+    check("06b re-shapes the hosted config into what create_template_version declares",
+          type(version).__name__ == declared("create_template_version", "template_config"))
+    check("...carrying the new template", version.template == "new {input.value}")
+    check("...and keeping the hosted judge's settings",
+          version.use_function_calling is False
+          and version.llm_config.model_name == "deepseek-v4-pro"
+          and version.classification_choices == hosted.classification_choices)
+    # The request/response split is recursive: the nested parameter blocks are
+    # response types too, and a judge temperature set in the UI must survive.
+    check("...down to the nested invocation parameters",
+          version.llm_config.invocation_parameters.temperature == 0.0)
+
+
 def check_session_evals() -> None:
     """A session score written to every span silently weights by conversation length."""
     console.print("\n[bold]Session-level evaluation (step 04b)[/bold]")
@@ -1732,9 +1807,10 @@ def check_sdk_surface() -> None:
 
     for module, symbol in [
         ("arize.experiments", "EvaluationResult"),
-        ("arize.evaluators.types", "TemplateConfig"),
-        ("arize.evaluators.types", "EvaluatorLlmConfig"),
-        ("arize.evaluators.types", "CustomCodeConfig"),
+        ("arize.evaluators.types", "TemplateConfigInput"),
+        ("arize.evaluators.types", "EvaluatorLlmConfigRequest"),
+        ("arize.evaluators.types", "CustomCodeConfigRequest"),
+        ("arize.evaluators.types", "CodeConfigRequest"),
         ("arize.tasks.types", "TaskType"),
         ("arize.tasks.types", "TaskEvaluatorInput"),
         ("arize.prompts.types", "LLMMessage"),
@@ -1765,6 +1841,7 @@ def main() -> None:
     check_monitor_metrics()
     check_annotation_queue_inputs()
     check_judge_alignment()
+    check_evaluator_requests()
     check_session_evals()
     check_backfill_spans()
     check_span_metadata_enrichment()

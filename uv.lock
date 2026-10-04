@@ -43,7 +43,7 @@ wheels = [
 
 [[package]]
 name = "arize"
-version = "8.43.1"
+version = "8.57.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -66,9 +66,9 @@ dependencies = [
     { name = "urllib3" },
     { name = "wrapt" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/10/e5/5f34d1defb2a7937ff5ee652dbd035403e5363e82cf2d50ea40ca1e6f24d/arize-8.43.1.tar.gz", hash = "sha256:a900b4f493adadff2f784c22c69ece9b51d25b2f614ab29853c45e360dc63275", size = 572448, upload-time = "2026-07-28T08:48:04.39Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/16/0f/432b63f0a89e111dee238eea1ef83699838fa28f71ff9adab5b1921e9f33/arize-8.57.0.tar.gz", hash = "sha256:36c16d23ca21c20b0b3f67f0c59665d640519b06a6b4bfddf99a92927f1090b3", size = 700047, upload-time = "2026-09-29T17:44:54.163Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c6/97/3276628e3b46cbd0d3185758daedd345556397cd1464861a9a427b7eb254/arize-8.43.1-py3-none-any.whl", hash = "sha256:4dba43fac0349537370979a1b66fe67a53b0258418429e51875687149163b1d6", size = 1357913, upload-time = "2026-07-28T08:48:02.038Z" },
+    { url = "https://files.pythonhosted.org/packages/a7/48/da5c7ecf6f7870be7010516eeedb7bcbca5643f77fc6fccfe2974bfc36a6/arize-8.57.0-py3-none-any.whl", hash = "sha256:c2a80ef3eb52bcfaf2ab5190b1100790ef3d9ab7d24caf91ad3830593198d317", size = 1698108, upload-time = "2026-09-29T17:44:52.323Z" },
 ]
 
 [package.optional-dependencies]
