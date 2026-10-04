@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "A support-copilot agent built to exercise the main features of Arize AX"
 requires-python = ">=3.10"
 dependencies = [
-    "arize[otel]>=8.0.0",
+    # A floor for the code, not just the lock: 05/06b build evaluator request
+    # types that 8.43 lacks. 8.57 is the oldest release verified against them.
+    "arize[otel]>=8.57.0",
     "arize-otel>=0.9.0",
     "arize-phoenix-evals>=2.0.0",
     "openinference-instrumentation>=0.1.0",
