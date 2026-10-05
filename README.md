@@ -10,11 +10,13 @@ the trace tree, and seeded with four failure modes that AX's evaluators are buil
 to catch. The tour then attempts to fix those failures and puts the fix to a
 statistical test.
 
-That test now says the fix **is** an improvement — on both platforms, at
-p<0.05 — but only once the dataset grew big enough to see it, and only on the
-judge's terms. At 32–35 examples it mostly could not tell, which is the more
-useful half of the demonstration: the loop's job is to tell you when a result
-is not yet evidence. See [the acceptance criterion](#the-tour) for both.
+That test now says v2 is **more concise**, clearly, on both platforms — and
+**probably more grounded**, though that half is significant on only one
+platform once each question is counted once rather than every time it repeats.
+It took a bigger dataset to say even that, and only on the judge's terms. At
+32–35 examples it mostly could not tell, which is the more useful half of the
+demonstration: the loop's job is to tell you when a result is not yet
+evidence. See [the acceptance criterion](#the-tour).
 
 ---
 
@@ -147,10 +149,10 @@ Lettered steps are side paths off the step they follow. `02b` is independent of
 the rest of the tour and writes to its own project; `04b` and `06b` read what
 the steps before them produced.
 
-**The acceptance criterion is step 08, and it took a big enough dataset to
-answer it.** The most recent tour: 108 turns of traffic (step 01 run three times,
+**The acceptance criterion is step 08, and a bigger dataset answered half of
+it.** The most recent tour: 108 turns of traffic (step 01 run three times,
 seeds 7, 8, 9), and from it 75 examples (63 failing turns + 12 controls) on
-each platform:
+each platform, as step 08 reports them:
 
 | evaluator | Arize v1 → v2 | rows changed | McNemar | LangSmith v1 → v2 | rows changed | McNemar |
 |---|---|---|---|---|---|---|
@@ -158,24 +160,48 @@ each platform:
 | `conciseness` | 0.68 → 0.96 ▲ | 21↑ 0↓ | p<0.001 | 0.72 → 0.97 ▲ | 19↑ 0↓ | p<0.001 |
 | `groundedness` | 0.36 → 0.48 ▲ | 9↑ 0↓ | **p=0.004** | 0.40 → 0.51 ▲ | 9↑ 1↓ | **p=0.021** |
 
-Both platforms independently re-ran every arm and re-judged every answer, and
-both call it: v2 is more concise and more grounded, and breaks almost nothing
-it touches. (The two datasets are the same traffic built twice, so this is one
-result confirmed twice, not two independent results.)
+Those p-values are row-level, and they assume every row is an independent
+trial. These rows are not. Step 01 draws from a 43-question pool, so 108 turns
+repeat questions, and step 07 keeps every failing turn: the 75 examples hold
+only 34 distinct questions on Arize and 33 on LangSmith, one of them five
+times. A question v2 fixes tends to be fixed each time it appears, so repeats
+stack flips that are really one piece of evidence. (Conversation history is
+*not* a source of correlation: each arm answers every example fresh, and the
+groundedness flips come from different conversations — bar one pair on
+LangSmith, which goes in opposite directions.)
+
+Re-tested with the question as the unit — each counted once, by the net
+direction of its flips:
+
+| evaluator | Arize, by question | McNemar | LangSmith, by question | McNemar |
+|---|---|---|---|---|
+| `conciseness` | 10↑ 0↓ | **p=0.002** | 9↑ 0↓ | **p=0.004** |
+| `groundedness` | 7↑ 0↓ | **p=0.016** | 7↑ 1↓ | p=0.070 |
+
+**Conciseness survives every way of counting it; groundedness survives on
+Arize and not on LangSmith.** So v2 is more concise, and probably more
+grounded — on each platform seven distinct questions improved and at most one
+got worse — but the significant half of that rests on one platform's run. The
+two datasets are the same traffic built twice, so this is one result checked
+twice, not a replication. Step 08 itself still prints the row-level test; the
+per-question figures were computed separately.
 
 **The smaller runs that came before could not say this, and that is the half of
 the result worth keeping.** At 35 examples, four tours on the same code read
 groundedness 0.48→0.52, 0.55→0.52, 0.43→0.63 and 0.49→0.54; only the third
 cleared p<0.05 (7↑ 0↓, p=0.016). A fresh-project tour at 32 examples read 4↑ 2↓,
 p=0.688. One significant result in five is what a real improvement of this size
-looks like at n≈35 — indistinguishable from none.
+looks like at n≈35 — indistinguishable from none. (These are row-level too, and
+their data is gone, so they were not re-tested per question.)
 
 What changed is not the code but the evidence. McNemar runs on the rows that
 *changed* between arms, and those scale with the dataset: on groundedness, 3–7
 discordant rows at 32–35 examples, 9–10 at 75. A two-sided exact test cannot
 reach p<0.05 on fewer than six however lopsided they are. Conciseness shows the
 same shape — 4↑ 0↓ in run after run at n=35 (p=0.125, uncallable), 21↑ 0↓ at
-n=75.
+n=75. But behind those 9–10 groundedness rows stand only 7–8 distinct
+questions, which is the catch: more traffic over a fixed question pool buys
+repeats faster than it buys independent evidence.
 
 This is exactly why step 08 tests significance (paired McNemar, since every arm
 answers the same inputs) rather than trusting a delta. An earlier version of the
@@ -199,11 +225,12 @@ it leaned nominally *better* on two of three. The sign flipping between runs is
 itself the finding: these deltas are inside the noise.
 
 Read that as **"no measurable quality cost on these 75 examples"**, not as
-"flash is as good". The prompt comparison above needed 9–10 discordant rows to
-call an 11–12-point groundedness gain; a model regression of a few points would
-sail through this test undetected. It is a reason to run the comparison on a dataset
-big enough to matter before moving production traffic, which is the point of
-having the arm at all — a prompt-only experiment never raises the question.
+"flash is as good". The prompt comparison above could only half-call an
+11–12-point groundedness gain at this size; a model regression of a few points
+would sail through this test undetected. It is a reason to run the comparison on
+a dataset big enough to matter before moving production traffic, which is the
+point of having the arm at all — a prompt-only experiment never raises the
+question.
 
 The dataset is also selected *on failures* (63 failing turns + 12 controls), so
 it deliberately over-samples the cases v2 targets. That is the right shape for
@@ -216,9 +243,9 @@ otherwise bury.**
 agreement has come out at 35–55% across tours (51% Arize, 55% LangSmith on the
 run above), and most of the disagreement is the judge flagging answers the
 human didn't — 43 of 53 on Arize, 45 of 49 on LangSmith. Step 08
-shows v2 scoring significantly better under that judge; it does not show v2
-hallucinating less. A significant result makes this caveat matter more, not
-less: the test is now sharp enough that what it is sharp *about* is the
+shows v2 scoring better under that judge; it does not show v2 hallucinating
+less. A sharper test makes this caveat matter more, not less: the closer the
+verdict gets to significant, the more what it is measuring becomes the
 question.
 
 And the "human" is a stand-in. Step 06's labels are simulated from the
@@ -242,10 +269,11 @@ also covers experiment traffic, so only the first pair is like-for-like. Same
 model, different template and harness. Whichever you wire a monitor to is the
 one that defines "groundedness" for your alerts.
 
-To harden the result further: collect real human labels, and re-run at this size
-or larger rather than reading one significant run as settled. Widening the
-dataset is what made the result visible at all — more traffic in step 01 → more
-graded failures in step 04 → more rows in step 07.
+To harden the result further: grow the number of *distinct* questions in
+`data/questions.jsonl`, not just the traffic over them — that is what adds
+independent evidence; give step 08 a question-clustered test so its own
+verdict can't overstate this again; collect real human labels; and re-run
+rather than reading one run as settled.
 
 Step 07 builds its dataset from step 04's **eval verdicts**, not step 03's
 heuristics. The heuristics are keyword-narrow — `check_ungrounded` only fires on
@@ -474,8 +502,9 @@ back is the rollback. Its verification probe is worth reading: v2, loaded from
 Prompt Hub, still answers "no, there are no prorated refunds." The KB documents
 that cancellation stops future charges and says *nothing* about proration, so
 that answer is inferred from an adjacent policy — the exact move v2's own
-grounding section forbids. Step 08 measured v2 as significantly *more*
-grounded, yet on that failure-heavy dataset v2 still scores only about 0.5.
+grounding section forbids. Step 08 measured v2 as *more* grounded (significant
+on one platform), yet on that failure-heavy dataset v2 still scores only about
+0.5.
 Better is not fixed, and this row is what the remaining half looks like.
 
 **Eval column names are case-sensitive, and collisions are invisible.** Columns
@@ -672,7 +701,9 @@ not hypothetical: the run that prompted the option measured 155 examples of
 which only 86 were current, and v2's groundedness win was **stronger** on the
 86 alone (`14↑ 2↓, p=0.004`) than on the blend — the older rows were diluting
 it, so the accumulated dataset was hiding a real improvement rather than
-inventing one.
+inventing one. (Row-level, like every figure before the per-question re-test
+in [the tour](#the-tour); that run's data has since been cleaned up, so it
+cannot be re-tested.)
 
 Every example now records the batch it came from, and each tour scopes a
 measurement the way its platform allows:
