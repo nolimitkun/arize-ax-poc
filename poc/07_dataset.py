@@ -108,6 +108,21 @@ ANNOTATION_NAME = "human_groundedness"
 BATCH_LIMIT = 1000
 
 
+def question_rows(df) -> list[list]:
+    """Composition rows that show how often the dataset repeats a question.
+
+    Step 01 draws traffic from a fixed question pool and this step keeps every
+    failing turn, so 75 examples can hold only 34 distinct questions. Step 08's
+    verdict counts each question once, which makes the distinct count -- not
+    the example count -- its effective sample size. Shared with ls07.
+    """
+    counts = df["question_id"].value_counts()
+    rows = [["distinct questions", int(counts.size)]]
+    if not counts.empty and counts.iloc[0] > 1:
+        rows.append(["most repeated question", f"{counts.index[0]} ×{int(counts.iloc[0])}"])
+    return rows
+
+
 def chunked(items: list, size: int):
     for start in range(0, len(items), size):
         yield items[start : start + size]
@@ -406,6 +421,7 @@ def main(
             *[[f"failure: {mode}", count] for mode, count in breakdown.items() if mode],
             ["control (already passing)", int(df["is_control"].sum())],
             ["total", len(df)],
+            *question_rows(df),
         ],
     )
 

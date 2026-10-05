@@ -252,28 +252,117 @@ def example_key(df) -> str | None:
     return None
 
 
-def paired_verdict(base_df, cand_df, name: str) -> tuple[int, int, float] | None:
-    """(only_v1_passed, only_v2_passed, p) for one evaluator, or None if unpairable."""
+def question_key(df) -> str | None:
+    """Column carrying each row's `question_id`, the unit the verdict counts in."""
+    for col in df.columns:
+        if col == "question_id" or col.endswith(".question_id"):
+            return col
+    return None
+
+
+def example_questions(client, space: str, dataset: str) -> dict[str, str]:
+    """Example id -> `question_id`, read from the dataset itself.
+
+    The results frame `experiments.run` returns carries `example_id` and the
+    task output but none of the dataset's fields, so the question each row
+    answered has to be joined back in from the examples. Empty on failure:
+    compare() then falls back to the row-level test and says so.
+    """
+    try:
+        response = client.datasets.list_examples(dataset=dataset, space=space, all=True)
+    except Exception as exc:  # noqa: BLE001 - the row-level test still runs
+        console.print(f"[yellow]Could not read the dataset's question ids ({exc}).[/yellow]")
+        return {}
+    index: dict[str, str] = {}
+    for _key, value in response:
+        if not isinstance(value, list):
+            continue
+        for example in value:
+            props = getattr(example, "additional_properties", None) or {}
+            question = str(props.get("question_id") or "")
+            if question:
+                index[str(example.id)] = question
+    return index
+
+
+def with_questions(df, questions: dict[str, str]):
+    """The results frame with a `question_id` column joined on the example key."""
+    key = example_key(df)
+    if key is None or not questions:
+        return df
+    out = df.copy()
+    out["question_id"] = out[key].astype(str).map(questions)
+    return out
+
+
+def flips(base_df, cand_df, name: str):
+    """One row per example both arms graded, with its flip and its question.
+
+    `flip` is +1 where only the candidate passed, -1 where only the baseline
+    did, 0 where they agree. `question` is present when the baseline frame
+    carries question ids. None if the frames can't be paired at all.
+    """
     key = example_key(base_df)
-    col = score_column(base_df, name)
-    if key is None or col is None or key not in cand_df.columns:
-        return None
-    if score_column(cand_df, name) is None:
+    base_col, cand_col = score_column(base_df, name), score_column(cand_df, name)
+    if key is None or key not in cand_df.columns or base_col is None or cand_col is None:
         return None
 
-    merged = base_df[[key, col]].merge(
-        cand_df[[key, score_column(cand_df, name)]], on=key, suffixes=("_base", "_cand")
-    )
+    left = base_df[[key, base_col]].rename(columns={base_col: "base"})
+    qkey = question_key(base_df)
+    if qkey is not None:
+        left["question"] = base_df[qkey].to_numpy()
+    merged = left.merge(cand_df[[key, cand_col]].rename(columns={cand_col: "cand"}), on=key)
     if merged.empty:
         return None
-    cols = [c for c in merged.columns if c != key]
-    base, cand = merged[cols[0]], merged[cols[1]]
-    usable = base.notna() & cand.notna()
+    merged = merged[merged["base"].notna() & merged["cand"].notna()].copy()
     # Scores here are 0/1; treat anything short of 1.0 as a failure.
-    base_pass, cand_pass = base[usable] >= 1.0, cand[usable] >= 1.0
-    only_base = int((base_pass & ~cand_pass).sum())
-    only_cand = int((cand_pass & ~base_pass).sum())
+    base_pass, cand_pass = merged["base"] >= 1.0, merged["cand"] >= 1.0
+    merged["flip"] = cand_pass.astype(int) - base_pass.astype(int)
+    return merged
+
+
+def paired_verdict(base_df, cand_df, name: str) -> tuple[int, int, float] | None:
+    """(only_v1_passed, only_v2_passed, p) for one evaluator, or None if unpairable.
+
+    Row-level: treats every example as an independent trial, which they are
+    not when the dataset repeats questions. See question_verdict().
+    """
+    merged = flips(base_df, cand_df, name)
+    if merged is None:
+        return None
+    only_base = int((merged["flip"] < 0).sum())
+    only_cand = int((merged["flip"] > 0).sum())
     return only_base, only_cand, mcnemar_p(only_base, only_cand)
+
+
+def question_verdict(base_df, cand_df, name: str) -> tuple[int, int, float] | None:
+    """The same paired test with the question, not the row, as the unit.
+
+    Step 01 draws traffic from a fixed question pool and step 07 keeps every
+    failing turn, so one question can sit in the dataset five times. A
+    question v2 fixes tends to be fixed each time it appears, and counting
+    each appearance stacks what is one piece of evidence into several -- the
+    row-level p-value then overstates the result.
+
+    Each question is counted once, by the net direction of its flips: more
+    fixed than broken is one question v2 won, more broken than fixed one it
+    lost, a tie is dropped. Returns (questions_v1_won, questions_v2_won, p),
+    or None when any paired row has no question id to cluster on.
+    """
+    merged = flips(base_df, cand_df, name)
+    if merged is None or "question" not in merged.columns:
+        return None
+    questions = merged["question"]
+    if questions.isna().any() or (questions.astype(str).str.strip() == "").any():
+        return None
+    net = merged.groupby("question")["flip"].sum()
+    only_base, only_cand = int((net < 0).sum()), int((net > 0).sum())
+    return only_base, only_cand, mcnemar_p(only_base, only_cand)
+
+
+def distinct_questions(df) -> int | None:
+    qkey = question_key(df) if df is not None else None
+    return int(df[qkey].nunique()) if qkey is not None else None
 
 
 def mean_scores(df, names: list[str]) -> dict[str, float]:
@@ -305,16 +394,25 @@ def compare(base_key: str, cand_key: str, summaries: dict, frames: dict) -> None
     Lifted out of main() so the model arm is held to the identical standard as
     the prompt arm; a second, looser comparison written inline is how a cheaper
     model ends up looking free.
+
+    Both tests are printed, and the verdict rests on the question-level one
+    (see question_verdict): the row-level test assumes independent rows, and
+    a dataset that repeats questions breaks that. On the 2026-10-03 tour, 75
+    examples held 33-34 distinct questions and the row-level test called a
+    groundedness win the question-level one could not confirm. Where the
+    frames carry no question ids, the row-level test decides and the output
+    says so.
     """
     base, cand = summaries.get(base_key, {}), summaries.get(cand_key, {})
     base_df, cand_df = frames.get(base_key), frames.get(cand_key)
     rows, improved, regressed, inconclusive, unpaired = [], 0, 0, 0, 0
+    row_only, overstated = 0, 0
 
     for name in sorted(set(base) | set(cand)):
         b, c = base.get(name), cand.get(name)
         if b is None or c is None:
             rows.append([name, f"{b:.2f}" if b is not None else "-",
-                         f"{c:.2f}" if c is not None else "-", "-", "-"])
+                         f"{c:.2f}" if c is not None else "-", "-", "-", "-"])
             continue
 
         delta = c - b
@@ -333,48 +431,77 @@ def compare(base_key: str, cand_key: str, summaries: dict, frames: dict) -> None
             # announced as a win -- the exact false positive this whole section
             # exists to prevent. Report it as untestable instead.
             evidence = "[yellow]unpaired — untestable[/yellow]"
+            by_question = "-"
             significant = False
             unpaired += 1
         else:
             only_base, only_cand, p = paired
             evidence = f"{only_cand}↑ {only_base}↓  p={p:.3f}"
-            significant = p < 0.05
-            if p >= 0.05 and abs(delta) > 0.005:
+            clustered = question_verdict(base_df, cand_df, name)
+            if clustered is None:
+                # No question ids to cluster on: the row-level test is the
+                # only one available. It is still a paired test, just an
+                # optimistic one when questions repeat, so it decides -- and
+                # the trailer says which evaluators it decided.
+                by_question = "[yellow]no question ids[/yellow]"
+                lost, won, verdict_p = only_base, only_cand, p
+                row_only += 1
+            else:
+                lost, won, verdict_p = clustered
+                by_question = f"{won}↑ {lost}↓  p={verdict_p:.3f}"
+                if p < 0.05 <= verdict_p:
+                    overstated += 1
+            significant = verdict_p < 0.05
+            if not significant and abs(delta) > 0.005:
                 inconclusive += 1
 
+        # Direction comes from the counts the test ran on, not the sign of the
+        # mean, so the arrow can't point against the evidence that earned it.
         if not significant:
             arrow = f"[dim]{delta:+.2f} ≈[/dim]"
-        elif delta > 0:
+        elif won > lost:
             improved += 1
             arrow = f"[green]{delta:+.2f} ▲[/green]"
         else:
             regressed += 1
             arrow = f"[red]{delta:+.2f} ▼[/red]"
 
-        rows.append([name, f"{b:.2f}", f"{c:.2f}", arrow, evidence])
+        rows.append([name, f"{b:.2f}", f"{c:.2f}", arrow, evidence, by_question])
 
     console.print()
     table(
         f"{base_key} vs {cand_key}",
-        ["evaluator", base_key, cand_key, "delta", "rows changed / McNemar"],
+        ["evaluator", base_key, cand_key, "delta", "rows / McNemar",
+         "questions / McNemar (verdict)"],
         rows,
     )
     console.print(
         "[dim]≈ means the change is not distinguishable from noise at p<0.05. "
-        "`3↑ 1↓` = 3 rows the variant fixed, 1 it broke.[/dim]"
+        "`3↑ 1↓` = 3 rows (or questions) the variant fixed, 1 it broke. A question "
+        "counts once, by the net direction of its rows; ties are dropped.[/dim]"
     )
 
     console.print()
     notes = []
     if inconclusive:
         notes.append(
-            f"{inconclusive} moved but not significantly — more rows would be needed "
-            "to call those."
+            f"{inconclusive} moved but not significantly — more distinct questions "
+            "would be needed to call those."
+        )
+    if overstated:
+        notes.append(
+            f"{overstated} cleared p<0.05 row by row but not once each question "
+            "counted once — repeated questions were stacking one result."
         )
     if unpaired:
         notes.append(
             f"{unpaired} could not be paired row-by-row, so no test was run on them "
             "— they are counted neither way."
+        )
+    if row_only:
+        notes.append(
+            f"{row_only} had no question ids to cluster on, so the row-level test "
+            "decided them — it overstates the evidence when questions repeat."
         )
     trailer = (" " + " ".join(notes)) if notes else ""
     if improved and not regressed:
@@ -395,12 +522,17 @@ def compare(base_key: str, cand_key: str, summaries: dict, frames: dict) -> None
             f"regressed significantly and none improved.{trailer}\n"
         )
     else:
+        n_rows = len(base_df) if base_df is not None else 0
+        n_questions = distinct_questions(base_df)
+        span = f"{n_rows} rows" + (
+            f" ({n_questions} distinct questions)" if n_questions is not None else ""
+        )
         console.print(
             f"[bold]No measurable difference[/bold] between {base_key} and {cand_key}. "
-            f"Nothing moved beyond noise on {len(base_df) if base_df is not None else 0} "
-            f"rows.{trailer} Read the per-row explanations in the experiment view "
-            "before changing anything again — and note that a bigger dataset raises "
-            "what this test can detect.\n"
+            f"Nothing moved beyond noise on {span}.{trailer} Read the per-row "
+            "explanations in the experiment view before changing anything again — "
+            "and note that more distinct questions, not more rows over the same "
+            "ones, is what raises what this test can detect.\n"
         )
 
 
@@ -437,6 +569,9 @@ def main(
     init_tracing(settings)
     client = arize_client(settings)
     dataset = resolve_dataset(client, settings.arize_space_name, dataset)
+    # The verdict counts questions, not rows; the results frame doesn't carry
+    # them, so read them off the dataset once and join them onto each arm.
+    questions = example_questions(client, settings.arize_space_name, dataset)
     stamp = datetime.now(timezone.utc).strftime("%m%d-%H%M")
     summaries: dict[str, dict[str, float]] = {}
     frames: dict[str, Any] = {}
@@ -494,6 +629,7 @@ def main(
             },
         )
         flush()
+        results = with_questions(results, questions)
         summaries[label] = mean_scores(results, names)
         frames[label] = results
         console.print(

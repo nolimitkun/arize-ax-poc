@@ -123,6 +123,10 @@ def to_frame(results) -> Any:
     `to_pandas()` puts each evaluator's score in a `feedback.<name>` column and
     the dataset example in `example_id`; renaming to `eval.<name>.score` lets
     `paired_verdict`, `mean_scores` and `compare` run unmodified.
+
+    `to_pandas()` drops the example's metadata, which is where ls07 keeps
+    `question_id` -- the unit compare()'s verdict counts in. Each result row
+    still carries its example, so the question is joined back from there.
     """
     df = results.to_pandas()
     renames = {
@@ -130,7 +134,14 @@ def to_frame(results) -> Any:
         for c in df.columns
         if c.startswith("feedback.")
     }
-    return df.rename(columns=renames)
+    df = df.rename(columns=renames)
+    questions = {
+        str(row["example"].id): (row["example"].metadata or {}).get("question_id")
+        for row in results
+    }
+    if "example_id" in df.columns:
+        df["question_id"] = df["example_id"].astype(str).map(questions)
+    return df
 
 
 @app.command()
