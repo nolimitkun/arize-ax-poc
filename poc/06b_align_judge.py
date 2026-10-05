@@ -218,7 +218,7 @@ def as_version_request(config, template: str):
 
     `evaluators.get` hands back the response type (`TemplateConfig`) and
     `create_template_version` takes the request type (`TemplateConfigInput`);
-    since SDK 8.57 they are distinct and the create call rejects the response
+    by SDK 8.57 they are distinct and the create call rejects the response
     type. Every other setting is carried across field by field, so a judge
     model or label set someone changed in the UI survives the new version.
 

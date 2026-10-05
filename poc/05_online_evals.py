@@ -80,7 +80,7 @@ def groundedness_config(integration_id: str, model_name: str):
 
     The request types (`TemplateConfigInput`, `EvaluatorLlmConfigRequest`) are
     not the response types `evaluators.get` returns (`TemplateConfig`, ...).
-    Since SDK 8.57 the create calls reject the response type outright -- and
+    By SDK 8.57 the create calls reject the response type outright -- and
     the response type silently ignores a field name it doesn't know, so the
     wrong type is worse than a crash when it *doesn't* crash.
     """

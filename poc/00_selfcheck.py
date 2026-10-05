@@ -653,9 +653,9 @@ def check_judge_alignment() -> None:
 def check_evaluator_requests() -> None:
     """What 05 and 06b send is the type the SDK's create calls declare.
 
-    A type merely *existing* proves nothing: SDK 8.57 kept `TemplateConfig`
-    and stopped accepting it, so every existence check passed while step 05
-    crashed on its first live call.
+    A type merely *existing* proves nothing: by SDK 8.57 `TemplateConfig`
+    still existed but was no longer accepted, so every existence check passed
+    while step 05 crashed on its first live call.
     """
     console.print("\n[bold]Evaluator request shapes (steps 05, 06b)[/bold]")
     import importlib
