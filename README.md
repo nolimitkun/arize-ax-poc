@@ -11,10 +11,11 @@ to catch. The tour then attempts to fix those failures and puts the fix to a
 statistical test.
 
 That test now says v2 is **more concise**, clearly, every time it has been
-measured — and **probably more grounded**, though once each question is counted
-once rather than every time it repeats, that half has cleared significance in
-only one of three measurements.
-It took a bigger dataset to say even that, and only on the judge's terms. At
+measured. Whether it is **more grounded** is not settled: counted once per
+question rather than every time a question repeats, groundedness leaned v2's
+way in all four measurements of the same traffic but cleared significance in
+only one, and the latest read 4 questions better, 3 worse.
+It took a bigger dataset to say even the conciseness half, and only on the judge's terms. At
 32–35 examples it mostly could not tell, which is the more useful half of the
 demonstration: the loop's job is to tell you when a result is not yet
 evidence. See [the acceptance criterion](#the-tour).
@@ -180,11 +181,12 @@ direction of its flips:
 | `groundedness` | 7↑ 0↓ | **p=0.016** | 7↑ 1↓ | p=0.070 |
 
 **Conciseness survives every way of counting it; groundedness survives on
-Arize and not on LangSmith.** So v2 is more concise, and probably more
-grounded — on each platform seven distinct questions improved and at most one
-got worse — but the significant half of that rests on one platform's run. The
-two datasets are the same traffic built twice, so this is one result checked
-twice, not a replication.
+Arize and not on LangSmith.** On that run v2 looked more concise, and probably
+more grounded — on each platform seven distinct questions improved and at most
+one got worse — but the significant half of that rested on one platform's run.
+The two datasets are the same traffic built twice, so this is one result
+checked twice, not a replication. The re-run below weakened the groundedness
+half further.
 
 Step 08 now runs this test itself. It joins each example's `question_id` back
 onto the results, prints the row-level and per-question tests side by side, and
@@ -192,34 +194,36 @@ bases its verdict on the per-question one; ls08 gets the same through the shared
 `compare()`. The figures above were computed by hand, with the same definition,
 before that change.
 
-Re-running step 08 with it on 2026-10-05, against the same Arize dataset
-(`copilot-failures-20261003-2212`) — fresh answers from every arm, fresh judge
-verdicts:
+Re-running steps 08 and ls08 with it on 2026-10-05, against the same datasets
+(Arize `copilot-failures-20261003-2212`, LangSmith batch `20261003-2213`) —
+fresh answers from every arm, fresh judge verdicts:
 
-| evaluator | Arize v1 → v2 | rows | McNemar | by question | McNemar (verdict) |
-|---|---|---|---|---|---|
-| `answers_from_context` | 1.00 → 0.94 ≈ | 0↑ 4↓ | p=0.125 | 0↑ 4↓ | p=0.125 |
-| `conciseness` | 0.72 → 0.95 ▲ | 17↑ 0↓ | p<0.001 | 8↑ 0↓ | **p=0.008** |
-| `groundedness` | 0.36 → 0.47 ≈ | 9↑ 1↓ | **p=0.021** | 6↑ 1↓ | p=0.125 |
+| evaluator | Arize v1 → v2 | rows | by question (verdict) | LangSmith v1 → v2 | rows | by question (verdict) |
+|---|---|---|---|---|---|---|
+| `answers_from_context` | 1.00 → 0.94 ≈ | 0↑ 4↓ p=0.125 | 0↑ 4↓ p=0.125 | 1.00 → 0.96 ≈ | 0↑ 3↓ p=0.250 | 0↑ 3↓ p=0.250 |
+| `conciseness` | 0.72 → 0.95 ▲ | 17↑ 0↓ p<0.001 | 8↑ 0↓ **p=0.008** | 0.69 → 0.96 ▲ | 20↑ 0↓ p<0.001 | 11↑ 0↓ **p=0.001** |
+| `groundedness` | 0.36 → 0.47 ≈ | 9↑ 1↓ **p=0.021** | 6↑ 1↓ p=0.125 | 0.43 → 0.47 ≈ | 6↑ 3↓ p=0.508 | 4↑ 3↓ p=1.000 |
 
-Step 08's verdict: v2 wins on conciseness alone, with the note that one
+Both verdicts: v2 wins on conciseness alone. On Arize, step 08 adds that one
 evaluator "cleared p<0.05 row by row but not once each question counted once".
 That evaluator is groundedness, and it is the case the per-question test was
 added for: the row-level test would have called it, on 9 flipped rows standing
-for 6 questions that improved and one that got worse.
+for 6 questions that improved and one that got worse. On LangSmith,
+groundedness did not clear even the row-level test.
 
-So across three measurements of the same traffic — Arize and LangSmith on
-2026-10-03, Arize again on 2026-10-05 — conciseness is significant per question
-every time (10↑ 0↓, 9↑ 0↓, 8↑ 0↓), and groundedness points the same way every
-time (7↑ 0↓, 7↑ 1↓, 6↑ 1↓) but clears p<0.05 once. Between the two Arize
-measurements the difference is one question fewer improved and one more got
-worse, and that was enough to cross the line. That is what a borderline result
-looks like: v2 probably helps groundedness, and this dataset is not big enough
-to say so reliably.
+So across four measurements of the same traffic — Arize and LangSmith on
+2026-10-03, both again on 2026-10-05 — conciseness is significant per question
+every time (10↑ 0↓, 9↑ 0↓, 8↑ 0↓, 11↑ 0↓). Groundedness leans v2's way every
+time (7↑ 0↓, 7↑ 1↓, 6↑ 1↓, 4↑ 3↓) but clears p<0.05 once, and the latest
+measurement is close to an even split. One significant result in four, on the
+same inputs, is the pattern the small 35-example tours below showed too: it
+does not establish that v2 is more grounded. If it helps, the effect is too
+small for 33–34 distinct questions to show.
 
-The counter-metric moved too: `answers_from_context` lost four questions under
-v2 and gained none. Not significant, but it is the direction the control group
-exists to watch — a groundedness gain bought with refusals.
+The counter-metric moved too: `answers_from_context` lost questions under v2
+on both platforms in the re-run (0↑ 4↓ and 0↑ 3↓) and gained none. Not
+significant, but it is the direction the control group exists to watch — v2
+refusing questions the documentation does answer.
 
 **The smaller runs that came before could not say this, and that is the half of
 the result worth keeping.** At 35 examples, four tours on the same code read
@@ -259,8 +263,9 @@ Same run, same datasets, holding the v2 prompt fixed and swapping
 
 Nothing significant. (Row-level, like the first table. With at most six
 discordant rows, none of these could clear p<0.05 per question either. The
-2026-10-05 re-run agrees, per question: 4↑ 2↓, 0↑ 2↓ and 4↑ 2↓ for
-`answers_from_context`, `conciseness` and `groundedness`, none significant.)
+2026-10-05 re-runs agree, per question — Arize 4↑ 2↓, 0↑ 2↓, 4↑ 2↓ and
+LangSmith 2↑ 0↓, 0↑ 4↓, 4↑ 1↓ for `answers_from_context`, `conciseness` and
+`groundedness` — none significant.)
 `flash` is roughly 6× smaller on active parameters, and it leans nominally
 *worse* on two of three on both platforms — where at 35 examples
 it leaned nominally *better* on two of three. The sign flipping between runs is
@@ -547,7 +552,7 @@ Prompt Hub, still answers "no, there are no prorated refunds." The KB documents
 that cancellation stops future charges and says *nothing* about proration, so
 that answer is inferred from an adjacent policy — the exact move v2's own
 grounding section forbids. Step 08 measured v2 as *more* grounded (significant
-per question in one of three measurements), yet on that failure-heavy dataset
+per question in one of four measurements), yet on that failure-heavy dataset
 v2 still scores only about 0.5.
 Better is not fixed, and this row is what the remaining half looks like.
 
