@@ -10,10 +10,13 @@ the trace tree, and seeded with four failure modes that AX's evaluators are buil
 to catch. The tour then attempts to fix those failures and puts the fix to a
 statistical test.
 
-That test currently says the fix is **not** proven — see
-[the acceptance criterion](#the-tour). That is a real result, not a broken repo,
-and arguably the more useful demonstration: the loop's job is to tell you when
-you have not improved anything.
+That test now says v2 is **more concise**, clearly, on both platforms — and
+**probably more grounded**, though that half is significant on only one
+platform once each question is counted once rather than every time it repeats.
+It took a bigger dataset to say even that, and only on the judge's terms. At
+32–35 examples it mostly could not tell, which is the more useful half of the
+demonstration: the loop's job is to tell you when a result is not yet
+evidence. See [the acceptance criterion](#the-tour).
 
 ---
 
@@ -54,16 +57,18 @@ no delta. So four failures are built in.
 | **Wrong tool** | v1's tool descriptions are one-liners (`"Get order info."`), so order questions should get routed to `search_docs`. | Code evaluator on the trajectory |
 | **Missing escalation** | v1 never mentions escalation, so blocked and angry users should never reach a human. | Code evaluator |
 
-### The bottom two traps no longer fire
+### The bottom two traps barely fire
 
-Measured against `deepseek-v4-pro` with thinking on: **8/8** order questions
-called `lookup_order` and **5/5** escalation questions called `escalate_ticket`.
-The model reasons past the deliberately useless tool descriptions every time.
-These traps were designed for a weaker, non-thinking model, and a stronger one
-walks through them.
+Measured against `deepseek-v4-pro` with thinking on, over 108 turns: **26/26**
+order questions called `lookup_order`, and **10/12** escalation questions
+called `escalate_ticket` (the two misses: a team locked out after enabling SSO,
+and a customer charged four times). The model reasons past the deliberately
+useless tool descriptions almost every time. These traps were designed for a
+weaker, non-thinking model, and a stronger one mostly walks through them.
 
 So **the acceptance criterion is groundedness and conciseness, not escalation** —
-v1 already scores 1.00 on escalation and there is no headroom to improve. The
+v1 already scores 0.97–0.98 on escalation and there is too little headroom to
+measure an improvement in. The
 first two rows still produce plenty of signal: the judge flags roughly half of
 all v1 answers as ungrounded. If you want the full four-mode demonstration back,
 the traps need recalibrating for a thinking model (making v1's tool descriptions
@@ -85,6 +90,13 @@ make check                # offline self-check: no credentials needed
 `make check` validates the corpus, the fixture, the evaluators, and that the
 dataframes match the Arize SDK's column contracts — so a later failure means
 "credentials or platform", not "the repo is broken".
+
+"Platform" includes the platform moving on. A checkout left idle for a while
+can fail inside the SDK with `Error due to additional fields (not defined in
+…)`: the server has started returning a field the locked SDK's generated
+models reject outright. That is a stale SDK, not a broken step — upgrade it
+(`uv lock --upgrade-package arize`) and re-run `make check`, which also builds
+the evaluator requests offline to catch the type changes an upgrade brings.
 
 You need an Arize space (`ARIZE_API_KEY`, `ARIZE_SPACE_ID`, `ARIZE_SPACE_NAME`)
 and a `DEEPSEEK_API_KEY`. One optional extra is called out at step 05.
@@ -137,59 +149,90 @@ Lettered steps are side paths off the step they follow. `02b` is independent of
 the rest of the tour and writes to its own project; `04b` and `06b` read what
 the steps before them produced.
 
-**The acceptance criterion is step 08, and it does not hold up across runs.**
-The most recent tour, 35 examples against `deepseek-v4-pro`:
+**The acceptance criterion is step 08, and a bigger dataset answered half of
+it.** The most recent tour: 108 turns of traffic (step 01 run three times,
+seeds 7, 8, 9), and from it 75 examples (63 failing turns + 12 controls) on
+each platform, as step 08 reports them:
 
-| evaluator | v1 | v2 | delta | rows changed | McNemar |
-|---|---|---|---|---|---|
-| `answers_from_context` | 1.00 | 1.00 | +0.00 ≈ | 0↑ 0↓ | p=1.000 |
-| `conciseness` | 0.77 | 0.89 | +0.11 ≈ | 4↑ 0↓ | p=0.125 |
-| `groundedness` | 0.49 | 0.54 | +0.06 ≈ | 3↑ 1↓ | p=0.625 |
+| evaluator | Arize v1 → v2 | rows changed | McNemar | LangSmith v1 → v2 | rows changed | McNemar |
+|---|---|---|---|---|---|---|
+| `answers_from_context` | 1.00 → 0.99 ≈ | 0↑ 1↓ | p=1.000 | 0.99 → 0.99 ≈ | 1↑ 1↓ | p=1.000 |
+| `conciseness` | 0.68 → 0.96 ▲ | 21↑ 0↓ | p<0.001 | 0.72 → 0.97 ▲ | 19↑ 0↓ | p<0.001 |
+| `groundedness` | 0.36 → 0.48 ▲ | 9↑ 0↓ | **p=0.004** | 0.40 → 0.51 ▲ | 9↑ 1↓ | **p=0.021** |
 
-Nothing clears p<0.05. An earlier tour on the same code did — groundedness
-0.43 → 0.63, 7↑ 0↓, **p=0.016** — and four tours now read 0.48→0.52,
-0.55→0.52, 0.43→0.63 and 0.49→0.54.
+Those p-values are row-level, and they assume every row is an independent
+trial. These rows are not. Step 01 draws from a 43-question pool, so 108 turns
+repeat questions, and step 07 keeps every failing turn: the 75 examples hold
+only 34 distinct questions on Arize and 33 on LangSmith, one of them five
+times. A question v2 fixes tends to be fixed each time it appears, so repeats
+stack flips that are really one piece of evidence. (Conversation history is
+*not* a source of correlation: each arm answers every example fresh, and the
+groundedness flips come from different conversations — bar one pair on
+LangSmith, which goes in opposite directions.)
 
-Those are *not* four runs of one experiment: each tour regenerates traffic in
-step 01 and rebuilds the dataset in step 07, so the inputs differ every time.
-But that is the point rather than an excuse. **One significant result out of
-four, on a rebuilt dataset each time, is what a real improvement of this size
-looks like at n=35 — indistinguishable from none.** Leading with the run that
-won would be cherry-picking; the honest summary is that v2 probably helps a
-little and this dataset cannot show it.
+Re-tested with the question as the unit — each counted once, by the net
+direction of its flips:
+
+| evaluator | Arize, by question | McNemar | LangSmith, by question | McNemar |
+|---|---|---|---|---|
+| `conciseness` | 10↑ 0↓ | **p=0.002** | 9↑ 0↓ | **p=0.004** |
+| `groundedness` | 7↑ 0↓ | **p=0.016** | 7↑ 1↓ | p=0.070 |
+
+**Conciseness survives every way of counting it; groundedness survives on
+Arize and not on LangSmith.** So v2 is more concise, and probably more
+grounded — on each platform seven distinct questions improved and at most one
+got worse — but the significant half of that rests on one platform's run. The
+two datasets are the same traffic built twice, so this is one result checked
+twice, not a replication. Step 08 itself still prints the row-level test; the
+per-question figures were computed separately.
+
+**The smaller runs that came before could not say this, and that is the half of
+the result worth keeping.** At 35 examples, four tours on the same code read
+groundedness 0.48→0.52, 0.55→0.52, 0.43→0.63 and 0.49→0.54; only the third
+cleared p<0.05 (7↑ 0↓, p=0.016). A fresh-project tour at 32 examples read 4↑ 2↓,
+p=0.688. One significant result in five is what a real improvement of this size
+looks like at n≈35 — indistinguishable from none. (These are row-level too, and
+their data is gone, so they were not re-tested per question.)
+
+What changed is not the code but the evidence. McNemar runs on the rows that
+*changed* between arms, and those scale with the dataset: on groundedness, 3–7
+discordant rows at 32–35 examples, 9–10 at 75. A two-sided exact test cannot
+reach p<0.05 on fewer than six however lopsided they are. Conciseness shows the
+same shape — 4↑ 0↓ in run after run at n=35 (p=0.125, uncallable), 21↑ 0↓ at
+n=75. But behind those 9–10 groundedness rows stand only 7–8 distinct
+questions, which is the catch: more traffic over a fixed question pool buys
+repeats faster than it buys independent evidence.
 
 This is exactly why step 08 tests significance (paired McNemar, since every arm
 answers the same inputs) rather than trusting a delta. An earlier version of the
 script counted any positive delta as a win, and duly declared victory on noise —
-it would have called three of these four tours a success.
-
-Conciseness moves the same direction in run after run with 4↑ 0↓ and still can't
-be called: roughly 5–6 unanimous flips are needed for p<0.05 at this n. That is
-the shape of an "obvious" improvement that isn't yet evidence.
+it would have called three of those four small tours a success.
 
 ### The model arm
 
-Same run, same dataset, holding the v2 prompt fixed and swapping
+Same run, same datasets, holding the v2 prompt fixed and swapping
 `deepseek-v4-pro` for `deepseek-v4-flash`:
 
-| evaluator | v2 (pro) | v2 (flash) | delta | rows changed | McNemar |
-|---|---|---|---|---|---|
-| `answers_from_context` | 1.00 | 1.00 | +0.00 ≈ | 0↑ 0↓ | p=1.000 |
-| `conciseness` | 0.89 | 1.00 | +0.11 ≈ | 4↑ 0↓ | p=0.125 |
-| `groundedness` | 0.54 | 0.63 | +0.09 ≈ | 3↑ 0↓ | p=0.250 |
+| evaluator | Arize pro → flash | rows changed | McNemar | LangSmith pro → flash | rows changed | McNemar |
+|---|---|---|---|---|---|---|
+| `answers_from_context` | 0.99 → 0.93 ≈ | 1↑ 5↓ | p=0.219 | 0.99 → 0.94 ≈ | 0↑ 3↓ | p=0.250 |
+| `conciseness` | 0.96 → 0.92 ≈ | 0↑ 3↓ | p=0.250 | 0.97 → 0.92 ≈ | 0↑ 4↓ | p=0.125 |
+| `groundedness` | 0.48 → 0.51 ≈ | 4↑ 2↓ | p=0.688 | 0.51 → 0.52 ≈ | 2↑ 1↓ | p=1.000 |
 
-The cheaper model did not score worse on anything — it scored nominally
-*better* on two of three, none significantly. `flash` is roughly 6× smaller on
-active parameters.
+Nothing significant. `flash` is roughly 6× smaller on active parameters, and it
+leans nominally *worse* on two of three on both platforms — where at 35 examples
+it leaned nominally *better* on two of three. The sign flipping between runs is
+itself the finding: these deltas are inside the noise.
 
-Read that as **"no measurable quality cost on these 35 examples"**, not as
-"flash is as good" and certainly not as "flash is better". At this sample size
-the test can only detect a large drop; a real 5-point regression would sail
-through undetected. It is a reason to run the comparison on a dataset big enough
-to matter before moving production traffic, which is the point of having the arm
-at all — a prompt-only experiment never raises the question.
+Read that as **"no measurable quality cost on these 75 examples"**, not as
+"flash is as good". The prompt comparison above could only half-call an
+11–12-point groundedness gain at this size; a model regression of a few points
+would sail through this test undetected. It is a reason to run the comparison on
+a dataset big enough to matter before moving production traffic, which is the
+point of having the arm at all — a prompt-only experiment never raises the
+question.
 
-The dataset is also selected *on failures* (23 failing turns + 12 controls), so
+The dataset is also selected *on failures* (63 failing turns + 12 controls), so
 it deliberately over-samples the cases v2 targets. That is the right shape for
 detecting a fix and the wrong shape for estimating production groundedness.
 
@@ -197,32 +240,46 @@ detecting a fix and the wrong shape for estimating production groundedness.
 otherwise bury.**
 
 *The metric that improved is one step 06 says not to trust yet.* Judge-vs-human
-agreement came out at 35–50%, almost all of it the judge flagging answers the
-human didn't. Step 08 shows v2 scoring better under that judge; it does not
-show v2 hallucinating less.
+agreement has come out at 35–55% across tours (51% Arize, 55% LangSmith on the
+run above), and most of the disagreement is the judge flagging answers the
+human didn't — 43 of 53 on Arize, 45 of 49 on LangSmith. Step 08
+shows v2 scoring better under that judge; it does not show v2 hallucinating
+less. A sharper test makes this caveat matter more, not less: the closer the
+verdict gets to significant, the more what it is measuring becomes the
+question.
 
-Step 06b now attempts the fix rather than only naming it — and reports that it
-could not certify one. Across three runs few-shot alignment moved held-out
-agreement up, down and nowhere, never approaching significance. **The caveat
-stands.** What changed is that there is now a measurement saying so, on rows the
-alignment never saw, instead of an unexamined assumption in either direction.
+And the "human" is a stand-in. Step 06's labels are simulated from the
+fixture's ground truth with a deliberate ~8% disagreement rate, so agreement is
+a real measurement rather than a tautology — but it is agreement with a
+fixture, not with a reviewer. Swap in real labels before trusting either number.
 
-*Two judges disagree wildly on the same spans.* Step 04's offline Phoenix judge
-scores the 38 turns at mean 0.47; the AX-hosted online evaluator from step 05
-scores the very same spans at 0.11 — visible side by side in step 10's metrics
-table, since the case difference keeps them in separate columns. Same model,
-same spans, different template and harness. Whichever you wire a monitor to is
-the one that defines "groundedness" for your alerts.
+Step 06b attempts the fix rather than only naming it — and reports that it
+could not certify one. Across three runs on 38 labels, few-shot alignment moved
+held-out agreement up, down and nowhere; on 108 labels it fixed 3 rows and broke
+4 (p=1.000). **The caveat stands.** What changed is that there is now a
+measurement saying so, on rows the alignment never saw, instead of an
+unexamined assumption in either direction.
 
-To harden the result: widen the dataset (more traffic in step 01 → more graded
-failures in step 04 → more rows in step 07, which raises the detectable effect
-size), and collect more human labels — step 06b shows the alignment measurement
-is label-starved long before it is technique-starved.
+*Two judges disagree wildly.* On one run, step 04's offline Phoenix judge scored
+38 turns at mean 0.47 and the AX-hosted online evaluator from step 05 scored the
+very same spans at 0.11 — visible side by side in step 10's metrics table, since
+the case difference keeps them in separate columns. The gap persists on the
+current project (0.56 offline vs 0.31 online), though there the online column
+also covers experiment traffic, so only the first pair is like-for-like. Same
+model, different template and harness. Whichever you wire a monitor to is the
+one that defines "groundedness" for your alerts.
+
+To harden the result further: grow the number of *distinct* questions in
+`data/questions.jsonl`, not just the traffic over them — that is what adds
+independent evidence; give step 08 a question-clustered test so its own
+verdict can't overstate this again; collect real human labels; and re-run
+rather than reading one run as settled.
 
 Step 07 builds its dataset from step 04's **eval verdicts**, not step 03's
 heuristics. The heuristics are keyword-narrow — `check_ungrounded` only fires on
-refund phrasing and found 2 hallucinations in 38 turns, where the judge grading
-every answer flagged 20. Run step 04 before step 07 or you get the narrow set.
+refund phrasing and found 3 hallucinations in 108 turns, where the judge
+grading every answer flagged 48. Run step 04 before step 07 or you get the
+narrow set.
 
 ---
 
@@ -253,8 +310,15 @@ the identical labels gave +2/−0 (37% → 47%), +1/−1 (37% → 37%) and +0/�
 
 A two-sided exact test cannot reach p<0.05 with fewer than six discordant rows
 however lopsided they are, so the step says so rather than letting a green arrow
-imply otherwise. The binding constraint is the number of human labels, not the
-template.
+imply otherwise. That made label count the obvious suspect — so the latest tour
+nearly tripled it: 108 labelled rows, 53 disagreements, a 54-row holdout. The
+aligned template agreed on 25 of 54 against the original's 26 (48% → 46%),
+fixing 3 rows and breaking 4, p=1.000.
+
+Seven discordant rows is enough to call a strongly lopsided split, and these
+are balanced. That no longer looks like a label shortage; it looks like
+few-shot alignment doing nothing measurable for this judge — against simulated
+labels, which is the caveat on every number in this section.
 
 Note what the *unaligned* judge did across those same three runs, over the same
 spans and the same labels: 37%, 37%, 42% — and 47% and 60% on two earlier ones.
@@ -288,8 +352,8 @@ does and what most eval tooling misses. A conversation can be made of turns that
 are each individually correct — grounded, concise, right tool — and still fail:
 the customer asks three times, gets three accurate non-answers, and leaves.
 
-On the current traffic: 15 sessions, 39 turns — 7 `unresolved`, 1 `frustrated`,
-7 `resolved`. Nearly half of these conversations ended without the customer
+On the current traffic: 36 sessions, 108 turns — 24 `resolved`, 8 `unresolved`,
+4 `frustrated`. A third of these conversations ended without the customer
 getting what they came for, which no turn-level average was going to tell you.
 
 The count of sessions that failed *while every turn in them passed* is **zero**,
@@ -398,7 +462,10 @@ DeepSeek provider, so it's registered as a **Custom** OpenAI-compatible one
 `poc/05_online_evals.py --create-integration` — which uploads your DeepSeek key
 to Arize, hence the flag — or add it by hand under **Space Settings →
 Integrations → Custom** and set `ARIZE_AI_INTEGRATION_ID`. The code evaluator
-works either way.
+doesn't need the integration, but it has its own gate: online code evaluators
+are a paid entitlement, and on a plan without them the API refuses ("not
+available for your account"). Step 05 reports that and carries on — the same
+check already ran locally in step 04, so only the continuous version is lost.
 
 **Step 07 → Prompt Playground.** Not scriptable, and worth doing by hand: open
 the `copilot-failures` dataset in Playground — and while you are there, check
@@ -428,14 +495,17 @@ aggregation (`avg`). Latency is `latency_ms` under `spanProperty` with `p95`.
 
 ## Two things steps 09 and 10 surface
 
-**Step 09 promotes v2, and step 08 says v2 isn't proven.** The `production`
-label is a pointer, not an endorsement — the step demonstrates that moving it
-changes runtime behaviour with no code change, and moving it back is the
-rollback. Its verification probe is worth reading: v2, loaded from Prompt Hub,
-still answers "no, there are no prorated refunds." The KB documents that
-cancellation stops future charges and says *nothing* about proration, so that
-answer is inferred from an adjacent policy — the exact move v2's own grounding
-section forbids. That is the same finding step 08 measured, in one concrete row.
+**Step 09 promotes v2, and v2 still does the thing it was written to stop.**
+The `production` label is a pointer, not an endorsement — the step demonstrates
+that moving it changes runtime behaviour with no code change, and moving it
+back is the rollback. Its verification probe is worth reading: v2, loaded from
+Prompt Hub, still answers "no, there are no prorated refunds." The KB documents
+that cancellation stops future charges and says *nothing* about proration, so
+that answer is inferred from an adjacent policy — the exact move v2's own
+grounding section forbids. Step 08 measured v2 as *more* grounded (significant
+on one platform), yet on that failure-heavy dataset v2 still scores only about
+0.5.
+Better is not fixed, and this row is what the remaining half looks like.
 
 **Eval column names are case-sensitive, and collisions are invisible.** Columns
 are keyed by the evaluator's name verbatim, so an online evaluator named
@@ -631,7 +701,9 @@ not hypothetical: the run that prompted the option measured 155 examples of
 which only 86 were current, and v2's groundedness win was **stronger** on the
 86 alone (`14↑ 2↓, p=0.004`) than on the blend — the older rows were diluting
 it, so the accumulated dataset was hiding a real improvement rather than
-inventing one.
+inventing one. (Row-level, like every figure before the per-question re-test
+in [the tour](#the-tour); that run's data has since been cleaned up, so it
+cannot be re-tested.)
 
 Every example now records the batch it came from, and each tour scopes a
 measurement the way its platform allows:
@@ -675,6 +747,22 @@ across all the traffic you have kept.
   `annotation.<name>.{label,score,text,...}` — that's what the SDK's validators
   actually require. (Phoenix's `to_annotation_dataframe()` emits a long format
   that matches neither; `make check` asserts the column patterns.)
+- **Arize SDK ≥ 8.57**, as a floor in `pyproject.toml` and not just in the lock.
+  Somewhere after 8.43, evaluator types split into request and response models:
+  `create_template_evaluator` / `create_template_version` accept only
+  `TemplateConfigInput` (with `EvaluatorLlmConfigRequest` inside), while
+  `evaluators.get` hands back `TemplateConfig`. So step 06b converts what it reads
+  before re-submitting it, nested parameter blocks included. Along the way
+  `use_function_calling_if_available` became `use_function_calling`, and the
+  response type silently drops a name it doesn't know — on the wrong type, the
+  setting DeepSeek needs (function calling off) would vanish without an error.
+- **Step 05 pre-wraps its code evaluator on purpose.** Handed a bare
+  `CustomCodeConfigRequest`, 8.57's own `_coerce_code_config` stores it in the
+  oneOf wrapper's validator slot instead of `actual_instance`, so `code_config`
+  serializes as `null` and the server answers 422 `version: Invalid input`. A
+  ready `CodeConfigRequest` is passed through untouched. Don't "simplify" it
+  back — `make check` serializes the config through the SDK's coercion and fails
+  on the bare form.
 - **Scope**: excludes SSO/RBAC, audit logs, compliance, guardrails, red-teaming,
   CI/CD experiments, and Agent Experiments against a live endpoint (that needs a
   deployed HTTP service, which the CLI-script shape doesn't provide).
