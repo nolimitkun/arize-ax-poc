@@ -259,6 +259,119 @@ def check_experiment_statistics() -> None:
     )
 
 
+def check_question_clustering() -> None:
+    """Repeated questions must not stack into extra evidence (poc/08's verdict).
+
+    Step 07 keeps every failing turn and step 01 draws from a fixed pool, so a
+    dataset can hold one question five times. The row-level test counts each
+    appearance; the verdict has to count the question once.
+    """
+    console.print("\n[bold]Question-clustered verdict (step 08)[/bold]")
+    from importlib import import_module
+
+    exp = import_module("08_experiments")
+
+    def frames(questions, base_scores, cand_scores):
+        ids = [f"e{i}" for i in range(len(questions))]
+        base = pd.DataFrame({"example_id": ids, "question_id": questions,
+                             "eval.groundedness.score": base_scores})
+        cand = pd.DataFrame({"example_id": ids, "eval.groundedness.score": cand_scores})
+        return base, cand
+
+    # One question three times, fixed every time: three rows, one question.
+    base, cand = frames(["q1", "q1", "q1", "q2"], [0, 0, 0, 1], [1, 1, 1, 1])
+    check("a question that flips 3 times counts 3 row-level flips",
+          exp.paired_verdict(base, cand, "groundedness")[:2] == (0, 3))
+    clustered = exp.question_verdict(base, cand, "groundedness")
+    check("...but one question-level flip", clustered is not None and clustered[:2] == (0, 1),
+          str(clustered))
+
+    # Opposite flips on the same question net to zero and are dropped.
+    base, cand = frames(["q1", "q1"], [0, 1], [1, 0])
+    clustered = exp.question_verdict(base, cand, "groundedness")
+    check("opposite flips on one question net to zero",
+          clustered == (0, 0, 1.0), str(clustered))
+    # 2 fixed, 1 broken on one question: v2 won that question, once.
+    base, cand = frames(["q1", "q1", "q1"], [0, 0, 1], [1, 1, 0])
+    clustered = exp.question_verdict(base, cand, "groundedness")
+    check("a net of 2↑ 1↓ on one question is one question won",
+          clustered is not None and clustered[:2] == (0, 1), str(clustered))
+
+    # No repeats: the two tests must agree exactly.
+    qs = [f"q{i}" for i in range(8)]
+    base, cand = frames(qs, [0, 0, 0, 0, 0, 0, 1, 1], [1, 1, 1, 1, 1, 1, 1, 0])
+    check("with every question distinct, the clustered test equals the row-level one",
+          exp.question_verdict(base, cand, "groundedness")
+          == exp.paired_verdict(base, cand, "groundedness"))
+
+    # Unscored rows are dropped before clustering, as before.
+    base, cand = frames(["q1", "q2"], [0, None], [1, 1])
+    check("rows a judge failed to score don't count toward a question",
+          exp.question_verdict(base, cand, "groundedness")[:2] == (0, 1))
+
+    # No question ids (or a gap in them): no clustered test, not a wrong one.
+    plain = pd.DataFrame({"example_id": ["e0"], "eval.groundedness.score": [0]})
+    check("frames without question ids have no clustered verdict",
+          exp.question_verdict(plain, plain, "groundedness") is None)
+    base, cand = frames(["q1", None], [0, 0], [1, 1])
+    check("...nor do frames with a missing question id",
+          exp.question_verdict(base, cand, "groundedness") is None)
+
+    # The verdict rests on the clustered test. Six rows of one question all
+    # fixed is p=0.031 row by row -- a "win" -- but it is one question.
+    def verdict(base, cand) -> str:
+        summaries = {
+            "v1": exp.mean_scores(base, ["groundedness"]),
+            "v2": exp.mean_scores(cand, ["groundedness"]),
+        }
+        with console.capture() as captured:
+            exp.compare("v1", "v2", summaries, {"v1": base, "v2": cand})
+        return captured.get()
+
+    base, cand = frames(["q1"] * 6, [0] * 6, [1] * 6)
+    out = verdict(base, cand)
+    check("six repeats of one fixed question are not a win",
+          "No measurable difference" in out and "wins" not in out, out[-300:])
+    check("...and the output says the row-level test would have overstated it",
+          "counted once" in out)
+    check("...and reports the distinct-question count", "1 distinct questions" in out)
+
+    base, cand = frames([f"q{i}" for i in range(6)], [0] * 6, [1] * 6)
+    out = verdict(base, cand)
+    check("six distinct fixed questions are a win", "v2 wins" in out, out[-300:])
+
+    plain_base = pd.DataFrame({"example_id": [f"e{i}" for i in range(6)],
+                               "eval.groundedness.score": [0] * 6})
+    plain_cand = plain_base.assign(**{"eval.groundedness.score": [1] * 6})
+    out = verdict(plain_base, plain_cand)
+    check("without question ids the row-level test decides, and says so",
+          "v2 wins" in out and "no question ids" in out, out[-300:])
+
+    # Arize: the results frame has no dataset fields, so question ids are read
+    # off the dataset's examples and joined on example_id.
+    from types import SimpleNamespace
+
+    class FakeDatasets:
+        def list_examples(self, **kw):
+            return [("examples", [
+                SimpleNamespace(id="e0", additional_properties={"question_id": "q7"}),
+                SimpleNamespace(id="e1", additional_properties={"question_id": "q7"}),
+                SimpleNamespace(id="e2", additional_properties={}),
+            ]), ("pagination", None)]
+
+    mapping = exp.example_questions(SimpleNamespace(datasets=FakeDatasets()), "s", "d")
+    check("example_questions maps example ids to question ids",
+          mapping == {"e0": "q7", "e1": "q7"}, str(mapping))
+    joined = exp.with_questions(
+        pd.DataFrame({"example_id": ["e0", "e1", "e2"], "eval.groundedness.score": [1, 1, 1]}),
+        mapping,
+    )
+    check("with_questions joins them onto the results frame by example_id",
+          joined["question_id"].tolist()[:2] == ["q7", "q7"]
+          and pd.isna(joined["question_id"].iloc[2]),
+          str(joined["question_id"].tolist()))
+
+
 def check_judge_verdict_parsing() -> None:
     """`ungrounded` must not read as `grounded` -- it inverts the verdict."""
     console.print("\n[bold]Judge verdict parsing[/bold]")
@@ -914,6 +1027,20 @@ def check_dataset_lifecycle() -> None:
     # 4xxs partway through, leaving the dataset half-updated.
     check("dataset writes are batched under the server's 1000-record cap",
           "BATCH_LIMIT = 1000" in source and source.count("chunked(") == 3)
+
+    # Step 08's verdict counts questions, so heavy repetition shrinks its real
+    # sample size; the composition table has to show that before it runs.
+    from importlib import import_module
+
+    rows = import_module("07_dataset").question_rows(
+        pd.DataFrame({"question_id": ["q041"] * 5 + ["q001", "q002"]})
+    )
+    check("composition reports distinct questions and the most repeated one",
+          rows == [["distinct questions", 3], ["most repeated question", "q041 ×5"]],
+          str(rows))
+    check("...on both platforms",
+          "*question_rows(df)" in source
+          and "*ds.question_rows(flat)" in Path(__file__).with_name("ls07_dataset.py").read_text())
 
 
 def check_experiment_arms() -> None:
@@ -1620,16 +1747,39 @@ def check_langsmith_tour() -> None:
         verdict["key"] == "conciseness" and verdict["score"] == 1.0,
         str(verdict),
     )
-    fake_results = SimpleNamespace(
-        to_pandas=lambda: pd.DataFrame(
-            {"example_id": ["e1"], "feedback.groundedness": [1.0], "outputs.answer": ["a"]}
+    class FakeResults:
+        """ExperimentResults: a frame via to_pandas(), and rows that keep the example."""
+
+        rows = (
+            {"example": SimpleNamespace(id="e1", metadata={"question_id": "q041"})},
+            {"example": SimpleNamespace(id="e2", metadata={})},
         )
-    )
-    renamed = ls08.to_frame(fake_results)
+
+        def to_pandas(self):
+            return pd.DataFrame({"example_id": ["e1", "e2"],
+                                 "feedback.groundedness": [1.0, 0.0],
+                                 "outputs.answer": ["a", "b"]})
+
+        def __iter__(self):
+            return iter(self.rows)
+
+    renamed = ls08.to_frame(FakeResults())
     check(
         "to_frame renames feedback columns into 08's .score shape",
         "eval.groundedness.score" in renamed.columns and "example_id" in renamed.columns,
         str(list(renamed.columns)),
+    )
+    # to_pandas() drops example metadata, where ls07 keeps question_id; without
+    # the join, ls08's verdict would silently fall back to the row-level test.
+    check(
+        "to_frame joins question_id from example metadata",
+        renamed["question_id"].iloc[0] == "q041" and pd.isna(renamed["question_id"].iloc[1]),
+        str(renamed.get("question_id", pd.Series(dtype=object)).tolist()),
+    )
+    check(
+        "ls08 reaches the clustered verdict through 08's compare()",
+        exp.question_key(renamed) == "question_id"
+        and "exp.compare(" in Path(__file__).with_name("ls08_experiments.py").read_text(),
     )
 
     # Project-scoped names everywhere a workspace-level artefact gets created.
@@ -1836,6 +1986,7 @@ def main() -> None:
     check_code_evaluators()
     check_retrieval_accumulates()
     check_experiment_statistics()
+    check_question_clustering()
     check_judge_verdict_parsing()
     check_prompt_hub_plumbing()
     check_monitor_metrics()

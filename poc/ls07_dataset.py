@@ -182,6 +182,7 @@ def main(
             *[[f"failure: {mode}", count] for mode, count in breakdown.items() if mode],
             ["control (already passing)", int(flat["is_control"].sum())],
             ["total", len(flat)],
+            *ds.question_rows(flat),
         ],
     )
 
